@@ -499,7 +499,7 @@ def _dispatch(
             plan,
             client=client,
             create_cwd=create_workspace_cwd,
-            create_ticket=lambda t, b: create_workspace_cubrid_ticket(t, base=b),
+            create_ticket=create_workspace_cubrid_ticket,
             create_pr=create_workspace_cubrid_pr,
             run_pane=pane_run,
             start_agent=agent_start,
@@ -531,7 +531,7 @@ def _dispatch(
             timeout=float(ns.timeout),
             force=bool(ns.force),
             dry_run=bool(ns.dry_run),
-            prompt_fn=lambda pid, text, w, t_ms: agent_prompt(pid, text, wait=w, timeout_ms=t_ms),
+            prompt_fn=agent_prompt,
         )
         return format_send(result, mode)
 

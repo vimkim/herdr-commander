@@ -6,10 +6,10 @@ import os
 import re
 import shlex
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from .models import (
     EXIT_DOMAIN,
@@ -29,6 +29,76 @@ from .snapshot import (
 )
 
 _CLAUDE_ENV_VARS = ("CLAUDE_ACCOUNTS_DIR", "CLAUDE_CONFIG_DIR", "XDG_STATE_HOME")
+
+
+class SnapshotClient(Protocol):
+    """Minimal Herdr client interface for snapshot-driven orchestration."""
+
+    def snapshot(self) -> dict[str, Any]: ...
+
+
+class WaitClient(SnapshotClient, Protocol):
+    """Herdr client interface for event-driven waiting and Claude verification."""
+
+    def read_detection(self, pane_id: str) -> str: ...
+
+    def subscribe_events(
+        self,
+        pane_ids: Sequence[str],
+        *,
+        deadline: float,
+    ) -> Iterator[dict[str, Any]]: ...
+
+
+class CreateCwdFn(Protocol):
+    """Callback matching `herdr_client.create_workspace_cwd`."""
+
+    def __call__(self, label: str, cwd: str) -> dict[str, Any]: ...
+
+
+class CreateTicketFn(Protocol):
+    """Callback matching `herdr_client.create_workspace_cubrid_ticket`."""
+
+    def __call__(self, ticket: str, *, base: str | None = None) -> dict[str, Any]: ...
+
+
+class CreatePrFn(Protocol):
+    """Callback matching `herdr_client.create_workspace_cubrid_pr`."""
+
+    def __call__(self, pr_number: str) -> dict[str, Any]: ...
+
+
+class RunPaneFn(Protocol):
+    """Callback matching `herdr_client.pane_run`."""
+
+    def __call__(self, pane_id: str, command: str) -> None: ...
+
+
+class StartAgentFn(Protocol):
+    """Callback matching `herdr_client.agent_start`."""
+
+    def __call__(
+        self,
+        name: str,
+        kind: str,
+        pane_id: str,
+        extra_args: Sequence[str],
+        *,
+        timeout_ms: int = 45000,
+    ) -> dict[str, Any]: ...
+
+
+class PromptAgentFn(Protocol):
+    """Callback matching `herdr_client.agent_prompt`."""
+
+    def __call__(
+        self,
+        pane_id: str,
+        prompt: str,
+        *,
+        wait: bool = False,
+        timeout_ms: int | None = None,
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -313,12 +383,12 @@ def plan_ensure(
 def execute_ensure(
     plan: EnsurePlan,
     *,
-    client: Any,
-    create_cwd: Callable[[str, str], dict[str, Any]],
-    create_ticket: Callable[[str, str | None], dict[str, Any]],
-    create_pr: Callable[[str], dict[str, Any]],
-    run_pane: Callable[[str, str], None],
-    start_agent: Callable[[str, str, str, list[str], int], dict[str, Any]],
+    client: SnapshotClient,
+    create_cwd: CreateCwdFn,
+    create_ticket: CreateTicketFn,
+    create_pr: CreatePrFn,
+    run_pane: RunPaneFn,
+    start_agent: StartAgentFn,
     env: Mapping[str, str],
     self_workspace_id: str | None = None,
     dry_run: bool = False,
@@ -349,7 +419,7 @@ def execute_ensure(
         created_meta = create_cwd(plan.label, target_cwd)
     elif plan.workspace_action == "create_cubrid_ticket":
         assert plan.ticket is not None
-        created_meta = create_ticket(plan.ticket, plan.base_ref)
+        created_meta = create_ticket(plan.ticket, base=plan.base_ref)
     elif plan.workspace_action == "create_cubrid_pr":
         assert plan.pr_number is not None
         created_meta = create_pr(plan.pr_number)
@@ -393,7 +463,7 @@ def execute_ensure(
             spec.agent_kind,
             pane.pane_id,
             build_agent_start_args(spec, env),
-            timeout_ms,
+            timeout_ms=timeout_ms,
         )
         refreshed = parse_snapshot(client.snapshot(), self_workspace_id=self_workspace_id)
         final_space = _locate_ensured_space(
@@ -441,7 +511,7 @@ def _locate_ensured_space(
 
 def _wait_for_launched_agent(
     *,
-    client: Any,
+    client: SnapshotClient,
     workspace_id: str,
     expected_agent: str,
     self_workspace_id: str | None,
@@ -554,7 +624,7 @@ def execute_send(
     timeout: float,
     force: bool,
     dry_run: bool,
-    prompt_fn: Callable[[str, str, bool, int | None], dict[str, Any]],
+    prompt_fn: PromptAgentFn,
 ) -> SendResult:
     """Validate and send a prompt to a workspace's first-tab agent."""
     validate_send(space, prompt=prompt, force=force)
@@ -576,7 +646,7 @@ def execute_send(
         )
 
     timeout_ms = int(timeout * 1000) if wait else None
-    result = prompt_fn(pane.pane_id, prompt, wait, timeout_ms)
+    result = prompt_fn(pane.pane_id, prompt, wait=wait, timeout_ms=timeout_ms)
     settled = result.get("agent_status") or result.get("status")
     return SendResult(
         dry_run=False,
@@ -617,7 +687,7 @@ def match_wait_targets(
 
 def execute_wait(
     *,
-    client: Any,
+    client: WaitClient,
     until: Sequence[str],
     workspace: str | None,
     workers_only: bool,
