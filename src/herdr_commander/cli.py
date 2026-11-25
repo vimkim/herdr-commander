@@ -6,6 +6,7 @@ import argparse
 import os
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 
 from . import __version__
 from .formatters import (
@@ -13,6 +14,7 @@ from .formatters import (
     OutputMode,
     format_ensure,
     format_error,
+    format_find,
     format_pane_close,
     format_pane_list,
     format_pane_spawn,
@@ -82,9 +84,11 @@ from .orchestrate import (
 )
 from .snapshot import (
     collect_live_agent_names,
+    collect_workspace_panes,
     correlate_work_tracker,
     count_session_working_agents,
     filter_spaces,
+    find_matching_spaces,
     parse_snapshot,
     parse_workspace_tabs,
     resolve_caller_context,
@@ -107,6 +111,7 @@ Exit codes:
 Examples:
   hcmd status --workers-only --verify-busy --with-tracker
   hcmd status --plain --fields number,workspace_id,attention,label
+  hcmd find --label my-repo --cwd ~/gh/my-repo --verify-busy --json
   hcmd peek w1 --lines 40
   hcmd wait --until blocked,done --timeout 300 --verify-busy --json
   hcmd ensure --ticket CBRD-10002 --launcher ai-agent --json
@@ -203,6 +208,50 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Comma-separated columns ({', '.join(STATUS_FIELDS)})",
     )
 
+    p_find = subparsers.add_parser(
+        "find",
+        parents=[common],
+        help=(
+            "Check whether existing workspaces already match a name, label, cwd/pwd, ticket, or PR"
+        ),
+    )
+    p_find.add_argument(
+        "query",
+        nargs="?",
+        default=None,
+        help="Optional free-form name, label, path, ticket, or workspace ID to match",
+    )
+    p_find.add_argument("--name", help="Match workspace label, agent name, or directory basename")
+    p_find.add_argument("--label", help="Match workspace label")
+    p_find.add_argument(
+        "--cwd",
+        "--pwd",
+        dest="cwd",
+        help="Match primary or sub-pane working directory (or parent directory)",
+    )
+    p_find.add_argument("--ticket", help="Match CUBRID JIRA ticket key (e.g. CBRD-10002)")
+    p_find.add_argument("--pr", help="Match CUBRID PR number (e.g. 1234)")
+    p_find.add_argument(
+        "--verify-busy",
+        action="store_true",
+        help="Inspect Claude detection buffer on matched workspaces to flag busy_bg",
+    )
+    p_find.add_argument(
+        "--with-tracker",
+        action="store_true",
+        help="Correlate matched workspaces with open work-tracker items",
+    )
+    p_find.add_argument(
+        "--include-self",
+        action="store_true",
+        help="Include the caller's own HERDR_WORKSPACE_ID in matches",
+    )
+    p_find.add_argument(
+        "--include-deleted",
+        action="store_true",
+        help="Include workspaces marked deleted or whose cwd is missing",
+    )
+
     p_peek = subparsers.add_parser(
         "peek",
         parents=[common],
@@ -255,6 +304,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_ensure.add_argument("--ticket", help="CUBRID JIRA ticket key (e.g. CBRD-10002)")
     p_ensure.add_argument("--pr", help="CUBRID PR number for review worktree")
     p_ensure.add_argument("--base", help="Base ref for `cubrid-worktree create --base`")
+    p_ensure.add_argument(
+        "--new",
+        action="store_true",
+        help="Create a new cwd workspace even if a matching workspace already exists",
+    )
     p_ensure.add_argument(
         "--launcher",
         default="ai-agent",
@@ -779,6 +833,43 @@ def _dispatch(
             warnings=warnings,
         )
 
+    if cmd == "find":
+        raw_snap = client.snapshot()
+        spaces = parse_snapshot(raw_snap, self_workspace_id=self_workspace_id)
+        panes_by_workspace = collect_workspace_panes(raw_snap)
+        result = find_matching_spaces(
+            spaces,
+            query=ns.query,
+            name=ns.name,
+            label=ns.label,
+            cwd=ns.cwd,
+            ticket=ns.ticket,
+            pr_number=ns.pr,
+            include_self=bool(ns.include_self),
+            include_deleted=bool(ns.include_deleted),
+            panes_by_workspace=panes_by_workspace,
+        )
+        warnings: list[str] = []
+        if result.matches:
+            matched_spaces = [m.space for m in result.matches]
+            if ns.verify_busy:
+                matched_spaces = verify_claude_busy(matched_spaces, client.read_detection)
+            if ns.with_tracker:
+                items, warn = fetch_work_tracker_items()
+                if warn:
+                    warnings.append(warn)
+                    if mode.fmt != "json":
+                        sys.stderr.write(f"Warning: {warn}\n")
+                matched_spaces = correlate_work_tracker(matched_spaces, items)
+            result = replace(
+                result,
+                matches=tuple(
+                    replace(match, space=space)
+                    for match, space in zip(result.matches, matched_spaces, strict=True)
+                ),
+            )
+        return format_find(result, mode, warnings=warnings)
+
     if cmd == "peek":
         if ns.lines <= 0:
             raise CliError(
@@ -855,6 +946,7 @@ def _dispatch(
             pr_number=ns.pr,
             launcher_name=ns.launcher,
             base_ref=ns.base,
+            force_new=bool(ns.new),
             existing_agent_names=collect_live_agent_names(raw_snap),
         )
         result = execute_ensure(

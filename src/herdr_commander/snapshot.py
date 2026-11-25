@@ -12,13 +12,17 @@ from typing import Any
 from .models import (
     ATTENTION_ORDER,
     EXIT_CONFIG,
+    EXIT_USAGE,
     CallerContext,
     CliError,
+    FindQuery,
+    FindResult,
     PaneInfo,
     PrimaryPane,
     SpaceSnapshot,
     SubTabRollup,
     TabSummary,
+    WorkspaceMatch,
     WorkspaceTabInfo,
 )
 
@@ -843,4 +847,307 @@ def resolve_pane_target(panes: Sequence[PaneInfo], selector: str) -> PaneInfo:
         "PANE_NOT_FOUND",
         f"No pane found matching {selector!r}.",
         "Run `hcmd pane list` to inspect panes in this tab.",
+    )
+
+
+_PRIMARY_EXACT_REASONS = frozenset(
+    {
+        "workspace_id_exact",
+        "label_exact",
+        "label_ci_exact",
+        "agent_name_exact",
+        "cwd_exact",
+        "foreground_cwd_exact",
+        "cwd_basename_exact",
+        "ticket_exact",
+        "pr_label_match",
+        "pr_cwd_match",
+        "pr_agent_name_match",
+    }
+)
+_SUB_PANE_EXACT_REASONS = frozenset(
+    {
+        "sub_pane_agent_name_exact",
+        "sub_pane_cwd_exact",
+    }
+)
+_EXACT_MATCH_REASONS = _PRIMARY_EXACT_REASONS | _SUB_PANE_EXACT_REASONS
+
+
+def _normalize_path_candidates(
+    path: str,
+    realpath_fn: Callable[[str], str] = os.path.realpath,
+) -> tuple[str, str]:
+    abs_path = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+    real_path = os.path.normpath(realpath_fn(abs_path))
+    return abs_path, real_path
+
+
+def _is_subdir(child: str, parent: str) -> bool:
+    return child != parent and child.startswith(parent.rstrip("/") + "/")
+
+
+def _matches_pr_token(text: str | None, norm_pr: str) -> bool:
+    if not text:
+        return False
+    pattern = rf"(?<![a-z0-9])pr[-_#]?{re.escape(norm_pr)}(?!\d)"
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+
+def _clean_opt(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def collect_workspace_panes(
+    raw: dict[str, Any],
+    *,
+    path_exists: Callable[[str], bool] = os.path.exists,
+) -> dict[str, tuple[PaneInfo, ...]]:
+    """Collect all ordered PaneInfo records across every tab for each workspace."""
+    result: dict[str, tuple[PaneInfo, ...]] = {}
+    for ws in raw.get("workspaces", []):
+        wid = ws.get("workspace_id")
+        if not isinstance(wid, str) or not wid:
+            continue
+        tabs = parse_workspace_tabs(raw, wid, path_exists=path_exists)
+        panes: list[PaneInfo] = []
+        for tab in tabs:
+            panes.extend(tab.panes)
+        result[wid] = tuple(panes)
+    return result
+
+
+def find_matching_spaces(
+    spaces: Sequence[SpaceSnapshot],
+    *,
+    query: str | None = None,
+    name: str | None = None,
+    label: str | None = None,
+    cwd: str | None = None,
+    ticket: str | None = None,
+    pr_number: str | None = None,
+    include_self: bool = False,
+    include_deleted: bool = False,
+    panes_by_workspace: Mapping[str, Sequence[PaneInfo]] | None = None,
+    home_dir: str | None = None,
+    realpath_fn: Callable[[str], str] = os.path.realpath,
+) -> FindResult:
+    """Find existing Herdr workspaces matching name, label, cwd/pwd, ticket, or PR."""
+    clean_query = _clean_opt(query)
+    clean_name = _clean_opt(name)
+    clean_label = _clean_opt(label)
+    clean_cwd = _clean_opt(cwd)
+    clean_ticket = _clean_opt(ticket)
+    clean_pr = _clean_opt(pr_number)
+
+    if not any((clean_query, clean_name, clean_label, clean_cwd, clean_ticket, clean_pr)):
+        raise CliError(
+            "MISSING_QUERY",
+            "Specify a query or at least one of --name, --label, --cwd/--pwd, --ticket, or --pr.",
+            "Example: `hcmd find --label my-repo --cwd ~/gh/my-repo --json`.",
+            exit_code=EXIT_USAGE,
+        )
+
+    norm_ticket = clean_ticket.upper() if clean_ticket else None
+    norm_pr = clean_pr.lstrip("#") if clean_pr else None
+    if norm_pr is not None and not norm_pr.isdigit():
+        raise CliError(
+            "INVALID_PR",
+            f"PR identifier must be a number, got {pr_number!r}.",
+            "Pass a numeric PR ID such as `--pr 1234`.",
+            exit_code=EXIT_USAGE,
+        )
+
+    norm_cwd: str | None = None
+    target_paths: set[str] = set()
+    if clean_cwd is not None:
+        norm_cwd, real_cwd = _normalize_path_candidates(clean_cwd, realpath_fn)
+        target_paths.update((norm_cwd, real_cwd))
+    elif clean_query is not None and (
+        clean_query.startswith(("~", "/", "./", "../")) or "/" in clean_query
+    ):
+        target_paths.update(_normalize_path_candidates(clean_query, realpath_fn))
+
+    home_paths = set(_normalize_path_candidates(home_dir or str(Path.home()), realpath_fn)) | {"/"}
+
+    matches: list[WorkspaceMatch] = []
+    for space in spaces:
+        if space.is_self and not include_self:
+            continue
+        if space.deleted_hint and not include_deleted:
+            continue
+
+        reasons: list[str] = []
+        matched_panes: list[str] = []
+
+        def add_reason(reason: str, *, _reasons: list[str] = reasons) -> None:
+            if reason not in _reasons:
+                _reasons.append(reason)
+
+        def add_pane(pane_id: str, *, _panes: list[str] = matched_panes) -> None:
+            if pane_id not in _panes:
+                _panes.append(pane_id)
+
+        pane = space.primary_pane
+        ws_panes = panes_by_workspace.get(space.workspace_id, ()) if panes_by_workspace else ()
+        sub_panes = [p for p in ws_panes if pane is None or p.pane_id != pane.pane_id]
+        primary_cwd_basename = Path(pane.cwd).name if pane and pane.cwd else ""
+
+        if clean_label is not None:
+            if space.label == clean_label:
+                add_reason("label_exact")
+            elif space.label.lower() == clean_label.lower():
+                add_reason("label_ci_exact")
+            elif len(clean_label) >= 2 and clean_label.lower() in space.label.lower():
+                add_reason("label_contains")
+            label_ticket = extract_ticket_key(clean_label)
+            if label_ticket is not None and space.ticket_key == label_ticket:
+                add_reason("ticket_exact")
+
+        for term in (clean_name, clean_query):
+            if term is None:
+                continue
+            term_lower = term.lower()
+            if space.workspace_id == term:
+                add_reason("workspace_id_exact")
+            if space.label == term:
+                add_reason("label_exact")
+            elif space.label.lower() == term_lower:
+                add_reason("label_ci_exact")
+            if pane and pane.agent_name and pane.agent_name.lower() == term_lower:
+                add_reason("agent_name_exact")
+                add_pane(pane.pane_id)
+            for sp in sub_panes:
+                if sp.agent_name and sp.agent_name.lower() == term_lower:
+                    add_reason("sub_pane_agent_name_exact")
+                    add_pane(sp.pane_id)
+            if primary_cwd_basename and primary_cwd_basename.lower() == term_lower:
+                add_reason("cwd_basename_exact")
+                if pane:
+                    add_pane(pane.pane_id)
+            term_ticket = extract_ticket_key(term)
+            if term_ticket is not None and space.ticket_key == term_ticket:
+                add_reason("ticket_exact")
+            if len(term) >= 2:
+                if (
+                    "label_exact" not in reasons
+                    and "label_ci_exact" not in reasons
+                    and term_lower in space.label.lower()
+                ):
+                    add_reason("label_contains")
+                if (
+                    "agent_name_exact" not in reasons
+                    and pane
+                    and pane.agent_name
+                    and term_lower in pane.agent_name.lower()
+                ):
+                    add_reason("agent_name_contains")
+                    add_pane(pane.pane_id)
+                if (
+                    "cwd_basename_exact" not in reasons
+                    and primary_cwd_basename
+                    and term_lower in primary_cwd_basename.lower()
+                ):
+                    add_reason("cwd_basename_contains")
+                    if pane:
+                        add_pane(pane.pane_id)
+
+        if target_paths:
+            if pane is not None:
+                pane_cwd_set = (
+                    set(_normalize_path_candidates(pane.cwd, realpath_fn)) if pane.cwd else set()
+                )
+                fg_cwd_set = (
+                    set(_normalize_path_candidates(pane.foreground_cwd, realpath_fn))
+                    if pane.foreground_cwd
+                    else set()
+                )
+                if target_paths & pane_cwd_set:
+                    add_reason("cwd_exact")
+                    add_pane(pane.pane_id)
+                elif target_paths & fg_cwd_set:
+                    add_reason("foreground_cwd_exact")
+                    add_pane(pane.pane_id)
+                elif not (target_paths & home_paths):
+                    if any(
+                        _is_subdir(p_path, t_path)
+                        for p_path in (pane_cwd_set | fg_cwd_set)
+                        for t_path in target_paths
+                    ):
+                        add_reason("cwd_subdir")
+                        add_pane(pane.pane_id)
+            for sp in sub_panes:
+                sp_paths: set[str] = set()
+                if sp.cwd:
+                    sp_paths.update(_normalize_path_candidates(sp.cwd, realpath_fn))
+                if sp.foreground_cwd:
+                    sp_paths.update(_normalize_path_candidates(sp.foreground_cwd, realpath_fn))
+                if target_paths & sp_paths:
+                    add_reason("sub_pane_cwd_exact")
+                    add_pane(sp.pane_id)
+
+        if norm_ticket is not None:
+            if space.ticket_key == norm_ticket:
+                add_reason("ticket_exact")
+            elif norm_ticket.lower() in space.label.lower() or (
+                pane is not None and norm_ticket.lower() in pane.cwd.lower()
+            ):
+                add_reason("ticket_contains")
+
+        if norm_pr is not None:
+            if _matches_pr_token(space.label, norm_pr):
+                add_reason("pr_label_match")
+            if primary_cwd_basename and _matches_pr_token(primary_cwd_basename, norm_pr):
+                add_reason("pr_cwd_match")
+                if pane:
+                    add_pane(pane.pane_id)
+            if pane and _matches_pr_token(pane.agent_name, norm_pr):
+                add_reason("pr_agent_name_match")
+                add_pane(pane.pane_id)
+
+        if reasons:
+            ordered_reasons = (
+                *[r for r in reasons if r in _PRIMARY_EXACT_REASONS],
+                *[r for r in reasons if r in _SUB_PANE_EXACT_REASONS],
+                *[r for r in reasons if r not in _EXACT_MATCH_REASONS],
+            )
+            strength = (
+                "exact" if any(r in _EXACT_MATCH_REASONS for r in ordered_reasons) else "partial"
+            )
+            matches.append(
+                WorkspaceMatch(
+                    space=space,
+                    match_reasons=ordered_reasons,
+                    match_strength=strength,
+                    matched_panes=tuple(matched_panes),
+                )
+            )
+
+    matches.sort(
+        key=lambda m: (
+            0 if m.match_strength == "exact" else 1,
+            0 if any(r in _PRIMARY_EXACT_REASONS for r in m.match_reasons) else 1,
+            -len(m.match_reasons),
+            m.space.number,
+            m.space.workspace_id,
+        )
+    )
+
+    return FindResult(
+        query=FindQuery(
+            query=clean_query,
+            name=clean_name,
+            label=clean_label,
+            cwd=norm_cwd,
+            ticket=norm_ticket,
+            pr_number=norm_pr,
+            include_self=include_self,
+            include_deleted=include_deleted,
+        ),
+        found=bool(matches),
+        recommendation="ask_reuse" if matches else "create_new",
+        matches=tuple(matches),
     )

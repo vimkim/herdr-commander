@@ -14,6 +14,7 @@ from .models import (
     CallerContext,
     CliError,
     EnsureResult,
+    FindResult,
     PaneCloseResult,
     PaneInfo,
     PaneSpawnResult,
@@ -314,6 +315,93 @@ def format_status(
     summary_bits = [f"{k}={v}" for k, v in counts.items() if v]
     lines.append("")
     lines.append(f"Total: {len(spaces)} ({', '.join(summary_bits)})")
+    return "\n".join(lines)
+
+
+def format_find(
+    result: FindResult,
+    mode: OutputMode,
+    *,
+    warnings: Sequence[str] = (),
+) -> str:
+    """Render `find` output in json, plain, or human format."""
+    if mode.fmt == "json":
+        payload = result.to_dict()
+        if warnings:
+            payload["warnings"] = list(warnings)
+        return format_json_success(payload)
+
+    if mode.fmt == "plain":
+        rows = []
+        for match in result.matches:
+            space = match.space
+            pane = space.primary_pane
+            rows.append(
+                "\t".join(
+                    (
+                        space.workspace_id,
+                        match.match_strength,
+                        ",".join(match.match_reasons),
+                        space.attention,
+                        pane.agent_kind or "shell" if pane else "-",
+                        space.primary_tab_id or "-",
+                        pane.pane_id if pane else "-",
+                        space.label,
+                        pane.cwd if pane and pane.cwd else "-",
+                    )
+                )
+            )
+        return "\n".join(rows)
+
+    if not result.found:
+        return "No existing Herdr workspace matches the query. Recommendation: create_new."
+
+    lines = [
+        f"Found {len(result.matches)} existing workspace(s) "
+        f"(recommendation: {result.recommendation}):"
+    ]
+    has_tracker = any(match.space.work_item_ids for match in result.matches)
+    header_parts = [
+        f"{'WS':<5}",
+        f"{'MATCH':<7}",
+        f"{'ATTN':<8}",
+        f"{'AGENT':<9}",
+        f"{'TAB':<7}",
+        f"{'PANE':<7}",
+    ]
+    if has_tracker:
+        header_parts.append(f"{'TRACKER':<10}")
+    header_parts.extend([f"{'LABEL':<22}", f"{'CWD':<28}", "REASONS"])
+    header = "  ".join(header_parts)
+    lines.append(f"{_ANSI_DIM}{header}{_ANSI_RESET}" if mode.color else header)
+
+    for match in result.matches:
+        space = match.space
+        pane = space.primary_pane
+        agent_str = pane.agent_kind or "shell" if pane else "-"
+        if pane and pane.effective_status == "busy_bg":
+            agent_str = f"{agent_str}(bg)"
+        attn_text = _colorize(f"{space.attention:<8}", space.attention, mode)
+        label_str = f"{space.label}*" if space.is_self else space.label
+        cwd_str = _shorten_path(pane.cwd) if pane else "-"
+        row_parts = [
+            f"{space.workspace_id:<5}",
+            f"{match.match_strength:<7}",
+            attn_text,
+            f"{agent_str:<9}",
+            f"{space.primary_tab_id or '-':<7}",
+            f"{pane.pane_id if pane else '-':<7}",
+        ]
+        if has_tracker:
+            wt = ",".join(f"#{i}" for i in space.work_item_ids) if space.work_item_ids else "-"
+            row_parts.append(f"{wt:<10}")
+        row_parts.extend([f"{label_str:<22}", f"{cwd_str:<28}", ",".join(match.match_reasons)])
+        lines.append("  ".join(row_parts))
+
+    lines.append("")
+    lines.append(
+        "Tip: Ask the user whether to reuse an existing workspace above before creating a new one."
+    )
     return "\n".join(lines)
 
 

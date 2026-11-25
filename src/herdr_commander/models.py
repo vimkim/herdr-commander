@@ -484,3 +484,57 @@ class PaneCloseResult:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class WorkspaceMatch:
+    """One existing Herdr workspace matched during a pre-launch lookup."""
+
+    space: SpaceSnapshot
+    match_reasons: tuple[str, ...]
+    match_strength: str  # "exact" | "partial"
+    matched_panes: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "match_strength": self.match_strength,
+            "match_reasons": list(self.match_reasons),
+            "matched_panes": list(self.matched_panes),
+            "workspace": self.space.to_dict(include_tabs=False),
+        }
+
+
+@dataclass(frozen=True)
+class FindQuery:
+    """Normalized parameters used for a pre-launch workspace lookup."""
+
+    query: str | None
+    name: str | None
+    label: str | None
+    cwd: str | None
+    ticket: str | None
+    pr_number: str | None
+    include_self: bool = False
+    include_deleted: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class FindResult:
+    """Result of checking whether matching Herdr workspaces already exist."""
+
+    query: FindQuery
+    found: bool
+    recommendation: str  # "ask_reuse" | "create_new"
+    matches: tuple[WorkspaceMatch, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "found": self.found,
+            "count": len(self.matches),
+            "recommendation": self.recommendation,
+            "query": self.query.to_dict(),
+            "matches": [match.to_dict() for match in self.matches],
+        }

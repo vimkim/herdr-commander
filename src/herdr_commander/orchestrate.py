@@ -366,6 +366,7 @@ def plan_ensure(
     pr_number: str | None,
     launcher_name: str,
     base_ref: str | None = None,
+    force_new: bool = False,
     existing_agent_names: set[str] | frozenset[str] = frozenset(),
     dir_exists: Callable[[str], bool] = os.path.isdir,
 ) -> EnsurePlan:
@@ -415,13 +416,30 @@ def plan_ensure(
             "Pass a numeric PR ID such as `--pr 1234`.",
             exit_code=EXIT_USAGE,
         )
+    if force_new and (norm_ticket or norm_pr):
+        raise CliError(
+            "NEW_UNSUPPORTED_FOR_WORKTREE",
+            (
+                "--new cannot be used with --ticket or --pr because CUBRID worktrees "
+                "map 1:1 to a ticket or PR."
+            ),
+            (
+                "Pass `--cwd <worktree-path> --label <new-label> --new` to open an "
+                "additional workspace in that directory."
+            ),
+            exit_code=EXIT_USAGE,
+        )
 
     derived_label = label or norm_ticket or (f"PR-{norm_pr}" if norm_pr else Path(norm_cwd).name)
-    existing = _find_matching_space(
-        spaces,
-        label=label,
-        norm_cwd=norm_cwd,
-        norm_ticket=norm_ticket,
+    existing = (
+        None
+        if force_new
+        else _find_matching_space(
+            spaces,
+            label=label,
+            norm_cwd=norm_cwd,
+            norm_ticket=norm_ticket,
+        )
     )
 
     if existing is not None:

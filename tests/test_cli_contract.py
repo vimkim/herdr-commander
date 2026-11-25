@@ -278,6 +278,153 @@ class CliContractTests(unittest.TestCase):
                 self.assertEqual(pane_data["caller"]["role"], "tab_leader")
                 self.assertEqual(pane_data["worker_pane_count"], 1)
 
+    def test_find_json_plain_human_and_errors(self) -> None:
+        snapshot = copy.deepcopy(json.loads(FIXTURE_PATH.read_text(encoding="utf-8")))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            live_dir = Path(tmpdir) / "demo-skills"
+            live_dir.mkdir()
+            for item in (*snapshot["panes"], *snapshot["agents"]):
+                if item["workspace_id"] == "w2":
+                    item["cwd"] = str(live_dir)
+                    if "foreground_cwd" in item:
+                        item["foreground_cwd"] = str(live_dir)
+                elif item["workspace_id"] != "w3":
+                    other_dir = Path(tmpdir) / item["workspace_id"]
+                    other_dir.mkdir(exist_ok=True)
+                    item["cwd"] = str(other_dir)
+                    if "foreground_cwd" in item:
+                        item["foreground_cwd"] = str(other_dir)
+
+            sock_path = Path(tmpdir) / "herdr.sock"
+            with MockHerdrServer(sock_path, snapshot):
+                found_proc = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "find",
+                        "--label",
+                        "demo-skills",
+                        "--pwd",
+                        str(live_dir),
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(found_proc.returncode, 0, found_proc.stderr)
+                self.assertEqual(found_proc.stderr, "")
+                found_data = json.loads(found_proc.stdout)["data"]
+                self.assertTrue(found_data["found"])
+                self.assertEqual(found_data["count"], 1)
+                self.assertEqual(found_data["recommendation"], "ask_reuse")
+                match = found_data["matches"][0]
+                self.assertEqual(match["workspace"]["workspace_id"], "w2")
+                self.assertIn("label_exact", match["match_reasons"])
+                self.assertIn("cwd_exact", match["match_reasons"])
+
+                busy_proc = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "find",
+                        "--ticket",
+                        "CBRD-10003",
+                        "--verify-busy",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(busy_proc.returncode, 0, busy_proc.stderr)
+                busy_data = json.loads(busy_proc.stdout)["data"]
+                self.assertEqual(
+                    busy_data["matches"][0]["workspace"]["primary_pane"]["effective_status"],
+                    "busy_bg",
+                )
+
+                miss_proc = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "find",
+                        "--label",
+                        "does-not-exist",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(miss_proc.returncode, 0, miss_proc.stderr)
+                miss_data = json.loads(miss_proc.stdout)["data"]
+                self.assertFalse(miss_data["found"])
+                self.assertEqual(miss_data["count"], 0)
+                self.assertEqual(miss_data["recommendation"], "create_new")
+                self.assertEqual(miss_data["matches"], [])
+
+                plain_proc = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "find",
+                        "--label",
+                        "demo-skills",
+                        "--plain",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(plain_proc.returncode, 0, plain_proc.stderr)
+                self.assertNotIn("\033", plain_proc.stdout)
+                self.assertIn("w2\texact\tlabel_exact\tidle\tclaude", plain_proc.stdout)
+
+                human_proc = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "find",
+                        "--label",
+                        "demo-skills",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(human_proc.returncode, 0, human_proc.stderr)
+                self.assertNotIn("\033", human_proc.stdout)
+                self.assertIn("recommendation: ask_reuse", human_proc.stdout)
+                self.assertIn("Ask the user whether to reuse", human_proc.stdout)
+
+                self_excluded = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "find",
+                        "--label",
+                        "herdr-spaces-status",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(self_excluded.returncode, 0, self_excluded.stderr)
+                self.assertFalse(json.loads(self_excluded.stdout)["data"]["found"])
+
+                self_included = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "find",
+                        "--label",
+                        "herdr-spaces-status",
+                        "--include-self",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(self_included.returncode, 0, self_included.stderr)
+                self_data = json.loads(self_included.stdout)["data"]
+                self.assertTrue(self_data["found"])
+                self.assertEqual(self_data["matches"][0]["workspace"]["workspace_id"], "w4")
+
+                err_proc = run_cli(["--socket", str(sock_path), "find", "--json"])
+                self.assertEqual(err_proc.returncode, 2)
+                self.assertEqual(err_proc.stdout, "")
+                err_payload = json.loads(err_proc.stderr.strip().splitlines()[-1])
+                self.assertEqual(err_payload["error"]["code"], "MISSING_QUERY")
+
 
 if __name__ == "__main__":
     unittest.main()

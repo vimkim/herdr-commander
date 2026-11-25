@@ -27,6 +27,20 @@ hcmd status --plain --fields number,workspace_id,attention,agent_kind,label
 - `--verify-busy` checks `agent.read(..., source="detection")` on `idle`/`done` Claude panes and marks background-active panes as `busy_bg` (counted under `working`).
 - `--with-tracker` correlates workspaces with open `work-tracker` items by `cwd` and `CBRD-NNNNN` ticket token.
 
+### `find`
+
+Check before launching whether an existing Herdr workspace already matches a target name, label, working directory (`--cwd`/`--pwd`), ticket, or PR:
+
+```bash
+hcmd find --label my-repo --cwd ~/gh/my-repo --verify-busy --json
+hcmd find --ticket CBRD-10002 --verify-busy --json
+hcmd find demo-lead --json
+```
+
+- Supports positional `query` and explicit `--name`, `--label`, `--cwd` / `--pwd`, `--ticket`, and `--pr` filters, plus `--verify-busy`, `--with-tracker`, `--include-self`, and `--include-deleted`.
+- Exits `0` both when matches are found (`found: true`, `recommendation: "ask_reuse"`) and when none match (`found: false`, `recommendation: "create_new"`).
+- Matches workspace labels, primary and sub-pane agent names, primary/foreground/sub-pane working directories (including symlinks and subdirectories under the target directory), tickets, and PR tokens while excluding `is_self` and `deleted_hint` workspaces by default.
+
 ### `peek`
 
 Read recent terminal output from a workspace's first-tab pane:
@@ -63,7 +77,7 @@ hcmd ensure --cwd ~/gh/my-repo --label my-repo --launcher ai-agent --json
 | `shell` | none | Workspace only, no agent. |
 
 - `ai-agent` runs `ai-agent --dry-run --json` before creating a workspace. `--dry-run` reports the predicted agent kind, and a quota failure such as `AI_AGENT_NO_ELIGIBLE_BACKEND` stops before any worktree is created. Either `agy` or `claude` in the first tab counts as a match for reuse and readiness.
-- Reuses matching open workspaces and matching running first-tab agents.
+- Reuses matching open workspaces and matching running first-tab agents (pass `--new` with `--cwd` to create a fresh workspace instead of reusing an existing one).
 - Delegates `--ticket` and `--pr` workspace creation to `cubrid-worktree` and `--cwd` creation to `herdr-next-to-current` or `herdr workspace create --no-focus`.
 - Refuses to overwrite a first-tab pane already occupied by a different agent kind (`OCCUPIED_BY_OTHER_AGENT`).
 

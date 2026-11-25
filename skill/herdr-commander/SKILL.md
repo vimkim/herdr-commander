@@ -10,7 +10,7 @@ Act strictly as the coordinator in your own Herdr workspace. Execute **all** wor
 - **All tasks run in Herdr workspaces + tabs**: Dispatch every piece of task work — implementation, debugging, investigation, code review, builds, tests, docs, or PR/CI work — into a Herdr workspace (Tab 1 via `hcmd ensure` and `hcmd send`) and its Herdr tabs. Never perform task work directly in the commander session or bypass Herdr with in-process subagents or swarms.
 - **Commander session scope**: Keep this session strictly on coordination — reconciling schedules and trackers, checking status, ensuring workspaces, sending briefs, waiting on events, peeking output, updating `work-tracker` / daily sheets, and reporting to the user.
 - **3-tier hierarchy & hard caps**:
-  - **Commander** (this session): manages Spaces via `hcmd status` / `ensure` / `send` / `wait` / `peek` (`hss` works as a compatibility alias).
+  - **Commander** (this session): manages Spaces via `hcmd status` / `find` / `ensure` / `send` / `wait` / `peek` (`hss` works as a compatibility alias).
   - **Space Leader** (`tabs[0]`, `panes[0]`): manages its own Space and may spawn up to **8 sub-tabs** (9 tabs total) via `hcmd tab spawn --label <role>` (`ai-agent` default; default guards of 4 live non-primary AI agents per Space and 10 working agents session-wide; `--launcher shell` unrestricted within the 8-tab cap).
   - **Tab Leader** (`tabs[1..8]`, `panes[0]`): may split up to **3 worker panes** (2×2 grid) inside its own tab via `hcmd pane spawn`; never creates new tabs.
   - **Leaf Worker** (`panes[1..]`): executes assigned work; never creates tabs or splits panes.
@@ -66,9 +66,30 @@ Do not choose `codex` or `claude` unless the user asks for it.
 
 Before dispatching several workspaces at once, check quota with `ai-agent --dry-run`. If it reports `NO_ELIGIBLE_BACKEND`, pause dispatch and tell the user instead of falling back to Codex.
 
-## 3. Ensure workspaces and brief Tab 1
+## 3. Check existing workspaces before launching
 
-Run `ensure` for each assigned task. It reuses matching open workspaces, creates CUBRID worktrees via `cubrid-worktree` or general directories via `herdr-next-to-current`, and waits until the first-tab agent is ready.
+Before calling `hcmd ensure` or opening any new workspace, **always** check whether a matching Herdr workspace is already open for the target name, label, pwd/cwd, ticket, or PR:
+
+```bash
+hcmd find --label my-project --cwd ~/gh/my-project --verify-busy --json
+hcmd find --ticket CBRD-10002 --verify-busy --json
+hcmd find --name demo-lead --verify-busy --json
+```
+
+Pass every known identifier (`--name`, `--label`, `--cwd` / `--pwd`, `--ticket`, `--pr`) so exact and partial matches on workspace labels, primary/sub-pane agent names, working directories, tickets, and PRs are all checked.
+
+- **When `data.found` is `true` (`recommendation == "ask_reuse"`)**:
+  - **Stop before calling `hcmd ensure` or `hcmd send`** (unless the user already explicitly asked in this turn to reuse or send to that exact workspace).
+  - Present each matched workspace with its live Herdr location (workspace label, primary tab label + `primary_tab_id`, `pane_id`), agent kind and `effective_status` / `attention` (plus `sub_tabs` if active), `cwd`, and `match_reasons`.
+  - **Propose delegating to the existing workspace and ask the user**, for example:
+    `"이미 <label> (tab <primary_tab_label> (<primary_tab_id>), pane <pane_id>, <agent_kind>:<effective_status>, cwd <cwd>) 워크스페이스가 띄워져 있습니다. 거기에 맡길까요, 아니면 새 워크스페이스를 띄울까요?"`
+  - If the user chooses to **reuse**: dispatch with `hcmd send <ws>` (if the workspace is an empty shell, run `hcmd ensure` first; if `working`/`busy_bg` or `blocked`, coordinate or surface the blocker before sending).
+  - If the user chooses to **create new**: run `hcmd ensure --cwd <dir> --label <new-label> --new --launcher ai-agent --json`.
+- **When `data.found` is `false` (`recommendation == "create_new"`)**: proceed directly to Step 4.
+
+## 4. Ensure workspaces and brief Tab 1
+
+Run `ensure` for each new or user-confirmed task. It reuses matching open workspaces (unless `--new` is passed for a `--cwd` workspace), creates CUBRID worktrees via `cubrid-worktree` or general directories via `herdr-next-to-current`, and waits until the first-tab agent is ready.
 
 ```bash
 hcmd ensure --ticket CBRD-10002 --launcher ai-agent --json
@@ -92,7 +113,7 @@ Never pass `--force` to bypass `AGENT_BLOCKED`. Inspect blocked dialogs with `hc
 
 Completion criterion. Every assigned task shows a ready or working agent in Tab 1, and `work-tracker` notes record the workspace ID.
 
-## 4. Monitor events and harvest outcomes
+## 5. Monitor events and harvest outcomes
 
 Wait on Herdr socket events instead of sleeping in a polling loop:
 
@@ -107,6 +128,6 @@ Handle woken workspaces in priority order.
 3. Check `sub_tabs.any_working` and `sub_tabs.any_blocked` from `hcmd status --workspace <ws> --json`. If a sub-tab is still working while Tab 1 reports `done`, ask Tab 1 to confirm sub-tab completion before closing out the item.
 4. Record verified outcomes with `work-tracker note` or `work-tracker status` and update `daily/today-YYYY-MM-DD.md`.
 
-## 5. Wrap up
+## 6. Wrap up
 
 List workspaces whose `work-tracker` items are `done` or whose `deleted_hint` is `true` as cleanup candidates. Never close Herdr workspaces or delete worktrees without explicit user approval.

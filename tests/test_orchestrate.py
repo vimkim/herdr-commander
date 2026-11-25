@@ -241,6 +241,68 @@ class OrchestrateTests(unittest.TestCase):
         numeric = sanitize_agent_name("1234", set())
         self.assertTrue(numeric[0].isalpha())
 
+    def test_plan_ensure_force_new_for_cwd_and_rejects_worktrees(self) -> None:
+        raw = load_fixture()
+        spaces = parse_snapshot(raw, self_workspace_id="w4", path_exists=lambda _p: True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            resolved_dir = str(Path(tmpdir).resolve())
+            raw_with_existing = _append_workspace(
+                raw,
+                workspace_id="w8",
+                label="existing-demo",
+                number=8,
+                tab_id="w8:t1",
+                pane_id="w8:p1",
+                cwd=resolved_dir,
+                agent_kind="claude",
+                agent_status="idle",
+            )
+            spaces_with_existing = parse_snapshot(
+                raw_with_existing, self_workspace_id="w4", path_exists=lambda _p: True
+            )
+
+            # Default behavior reuses matching cwd.
+            reused = plan_ensure(
+                spaces_with_existing,
+                label="new-demo",
+                cwd=resolved_dir,
+                ticket=None,
+                pr_number=None,
+                launcher_name="ai-agent",
+            )
+            self.assertEqual(reused.workspace_action, "reuse")
+            self.assertEqual(reused.existing_workspace_id, "w8")
+
+            # force_new=True forces a fresh cwd workspace instead of reusing w8.
+            forced = plan_ensure(
+                spaces_with_existing,
+                label="new-demo",
+                cwd=resolved_dir,
+                ticket=None,
+                pr_number=None,
+                launcher_name="ai-agent",
+                force_new=True,
+            )
+            self.assertEqual(forced.workspace_action, "create_cwd")
+            self.assertIsNone(forced.existing_workspace_id)
+            self.assertEqual(forced.label, "new-demo")
+
+        for kwargs in (
+            {"ticket": "CBRD-10001", "pr_number": None},
+            {"ticket": None, "pr_number": "1234"},
+        ):
+            with self.assertRaises(CliError) as err:
+                plan_ensure(
+                    spaces,
+                    label=None,
+                    cwd=None,
+                    launcher_name="ai-agent",
+                    force_new=True,
+                    **kwargs,
+                )
+            self.assertEqual(err.exception.code, "NEW_UNSUPPORTED_FOR_WORKTREE")
+
 
 def _append_workspace(
     snapshot: dict,

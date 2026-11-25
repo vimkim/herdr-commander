@@ -7,8 +7,10 @@ from pathlib import Path
 from herdr_commander.models import CliError
 from herdr_commander.snapshot import (
     classify_claude_detection,
+    collect_workspace_panes,
     correlate_work_tracker,
     filter_spaces,
+    find_matching_spaces,
     parse_snapshot,
     resolve_target,
     verify_claude_busy,
@@ -174,6 +176,183 @@ class SnapshotTests(unittest.TestCase):
         attn = filter_spaces(spaces, workers_only=True, attention_only=True)
         self.assertNotIn("w3", [s.workspace_id for s in attn])
         self.assertIn("w5", [s.workspace_id for s in attn])
+
+    def test_find_matching_spaces_by_label_name_cwd_ticket_and_pr(self) -> None:
+        raw = load_fixture()
+        raw["workspaces"].append(
+            {
+                "active_tab_id": "w7:t1",
+                "agent_status": "idle",
+                "focused": False,
+                "label": "review-pr-1234",
+                "number": 7,
+                "pane_count": 1,
+                "tab_count": 1,
+                "workspace_id": "w7",
+            }
+        )
+        raw["tabs"].append(
+            {
+                "agent_status": "idle",
+                "focused": False,
+                "label": "1 [t1]",
+                "number": 1,
+                "pane_count": 1,
+                "tab_id": "w7:t1",
+                "workspace_id": "w7",
+            }
+        )
+        raw["panes"].append(
+            {
+                "agent": "claude",
+                "agent_status": "idle",
+                "cwd": "/home/user/gh/cb/PR-12345",
+                "foreground_cwd": "/home/user/gh/cb/PR-12345/build",
+                "focused": False,
+                "pane_id": "w7:p1",
+                "revision": 700,
+                "tab_id": "w7:t1",
+                "workspace_id": "w7",
+            }
+        )
+        raw["agents"].append(
+            {
+                "agent": "claude",
+                "agent_status": "idle",
+                "cwd": "/home/user/gh/cb/PR-12345",
+                "interactive_ready": True,
+                "name": "pr-1234-review",
+                "pane_id": "w7:p1",
+                "revision": 700,
+                "tab_id": "w7:t1",
+                "workspace_id": "w7",
+            }
+        )
+        # Set foreground_cwd different from cwd on w2:p4 to verify foreground_cwd matching.
+        for pane in raw["panes"]:
+            if pane["pane_id"] == "w2:p4":
+                pane["foreground_cwd"] = "/home/user/gh/demo-skills/subdir"
+
+        spaces = parse_snapshot(
+            raw,
+            self_workspace_id="w4",
+            path_exists=lambda p: "old-experiment" not in p,
+        )
+        panes_by_ws = collect_workspace_panes(raw, path_exists=lambda p: "old-experiment" not in p)
+
+        # Label exact + case-insensitive + partial ordering & deduplication.
+        res_label = find_matching_spaces(
+            spaces,
+            label="DEMO-SKILLS",
+            cwd="/home/user/gh/demo-skills",
+            panes_by_workspace=panes_by_ws,
+            home_dir="/home/user",
+        )
+        self.assertTrue(res_label.found)
+        self.assertEqual(res_label.recommendation, "ask_reuse")
+        self.assertEqual(len(res_label.matches), 1)
+        self.assertEqual(res_label.matches[0].space.workspace_id, "w2")
+        self.assertEqual(res_label.matches[0].match_strength, "exact")
+        self.assertIn("label_ci_exact", res_label.matches[0].match_reasons)
+        self.assertIn("cwd_exact", res_label.matches[0].match_reasons)
+
+        # Primary agent name vs sub-pane agent name.
+        res_primary_agent = find_matching_spaces(
+            spaces, name="demo-lead", panes_by_workspace=panes_by_ws
+        )
+        self.assertEqual([m.space.workspace_id for m in res_primary_agent.matches], ["w1"])
+        self.assertIn("agent_name_exact", res_primary_agent.matches[0].match_reasons)
+
+        res_sub_agent = find_matching_spaces(
+            spaces, name="build-worker", panes_by_workspace=panes_by_ws
+        )
+        self.assertEqual([m.space.workspace_id for m in res_sub_agent.matches], ["w1"])
+        self.assertEqual(res_sub_agent.matches[0].match_reasons, ("sub_pane_agent_name_exact",))
+        self.assertEqual(res_sub_agent.matches[0].matched_panes, ("w1:p2",))
+
+        # Foreground cwd exact and symlink realpath matching.
+        res_fg = find_matching_spaces(
+            spaces,
+            cwd="/home/user/gh/demo-skills/subdir",
+            panes_by_workspace=panes_by_ws,
+            home_dir="/home/user",
+        )
+        self.assertEqual([m.space.workspace_id for m in res_fg.matches], ["w2"])
+        self.assertIn("foreground_cwd_exact", res_fg.matches[0].match_reasons)
+
+        res_symlink = find_matching_spaces(
+            spaces,
+            cwd="/var/link/demo-skills",
+            panes_by_workspace=panes_by_ws,
+            home_dir="/home/user",
+            realpath_fn=lambda p: (
+                "/home/user/gh/demo-skills" if p == "/var/link/demo-skills" else p
+            ),
+        )
+        self.assertEqual([m.space.workspace_id for m in res_symlink.matches], ["w2"])
+        self.assertIn("cwd_exact", res_symlink.matches[0].match_reasons)
+
+        # Subdir matching works for repo parent, but $HOME never causes false subdir matches.
+        res_parent = find_matching_spaces(
+            spaces,
+            cwd="/home/user/gh/cb",
+            panes_by_workspace=panes_by_ws,
+            home_dir="/home/user",
+        )
+        self.assertEqual(
+            {m.space.workspace_id for m in res_parent.matches}, {"w1", "w5", "w6", "w7"}
+        )
+        for m in res_parent.matches:
+            self.assertIn("cwd_subdir", m.match_reasons)
+            self.assertEqual(m.match_strength, "partial")
+
+        res_home = find_matching_spaces(
+            spaces,
+            cwd="/home/user",
+            panes_by_workspace=panes_by_ws,
+            home_dir="/home/user",
+        )
+        self.assertFalse(res_home.found)
+        self.assertEqual(res_home.recommendation, "create_new")
+
+        # Ticket and PR boundary matching (1234 must not match cwd PR-12345).
+        res_ticket = find_matching_spaces(spaces, ticket="cbrd-10001")
+        self.assertEqual([m.space.workspace_id for m in res_ticket.matches], ["w1"])
+        self.assertEqual(res_ticket.matches[0].match_reasons, ("ticket_exact",))
+
+        res_pr = find_matching_spaces(spaces, pr_number="#1234")
+        self.assertEqual([m.space.workspace_id for m in res_pr.matches], ["w7"])
+        self.assertIn("pr_label_match", res_pr.matches[0].match_reasons)
+        self.assertIn("pr_agent_name_match", res_pr.matches[0].match_reasons)
+        self.assertNotIn("pr_cwd_match", res_pr.matches[0].match_reasons)
+
+        # Positional query matching path-like string and basename.
+        res_path_query = find_matching_spaces(
+            spaces,
+            query="/home/user/gh/cb/CBRD-10002",
+            home_dir="/home/user",
+        )
+        self.assertEqual([m.space.workspace_id for m in res_path_query.matches], ["w5"])
+        self.assertIn("cwd_exact", res_path_query.matches[0].match_reasons)
+
+        # Default exclusions of self (w4) and deleted (w3), and opt-in flags.
+        self.assertFalse(find_matching_spaces(spaces, label="herdr-spaces-status").found)
+        self.assertTrue(
+            find_matching_spaces(spaces, label="herdr-spaces-status", include_self=True).found
+        )
+        self.assertFalse(find_matching_spaces(spaces, label="old-experiment").found)
+        self.assertTrue(
+            find_matching_spaces(spaces, label="old-experiment", include_deleted=True).found
+        )
+
+        # Error handling.
+        with self.assertRaises(CliError) as missing_err:
+            find_matching_spaces(spaces, query="   ", label="")
+        self.assertEqual(missing_err.exception.code, "MISSING_QUERY")
+
+        with self.assertRaises(CliError) as bad_pr_err:
+            find_matching_spaces(spaces, pr_number="abc")
+        self.assertEqual(bad_pr_err.exception.code, "INVALID_PR")
 
 
 if __name__ == "__main__":
