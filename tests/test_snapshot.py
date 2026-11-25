@@ -319,14 +319,16 @@ class SnapshotTests(unittest.TestCase):
         res_ticket = find_matching_spaces(spaces, ticket="cbrd-10001")
         self.assertEqual([m.space.workspace_id for m in res_ticket.matches], ["w1"])
         self.assertEqual(res_ticket.matches[0].match_reasons, ("ticket_exact",))
+        self.assertEqual(res_ticket.recommendation, "warn_busy")
 
         res_pr = find_matching_spaces(spaces, pr_number="#1234")
         self.assertEqual([m.space.workspace_id for m in res_pr.matches], ["w7"])
         self.assertIn("pr_label_match", res_pr.matches[0].match_reasons)
         self.assertIn("pr_agent_name_match", res_pr.matches[0].match_reasons)
         self.assertNotIn("pr_cwd_match", res_pr.matches[0].match_reasons)
+        self.assertEqual(res_pr.recommendation, "ask_reuse")
 
-        # Positional query matching path-like string and basename.
+        # Positional query matching path-like string and empty shell recommendation.
         res_path_query = find_matching_spaces(
             spaces,
             query="/home/user/gh/cb/CBRD-10002",
@@ -334,6 +336,26 @@ class SnapshotTests(unittest.TestCase):
         )
         self.assertEqual([m.space.workspace_id for m in res_path_query.matches], ["w5"])
         self.assertIn("cwd_exact", res_path_query.matches[0].match_reasons)
+        self.assertEqual(res_path_query.recommendation, "reuse_empty_shell")
+
+        # Partial match on an empty shell recommends ask_reuse rather than auto reuse_empty_shell.
+        res_partial_shell = find_matching_spaces(spaces, label="10002")
+        self.assertEqual([m.space.workspace_id for m in res_partial_shell.matches], ["w5"])
+        self.assertEqual(res_partial_shell.matches[0].match_strength, "partial")
+        self.assertEqual(res_partial_shell.recommendation, "ask_reuse")
+
+        # busy_bg or working primary pane triggers warn_busy.
+        verified_spaces = verify_claude_busy(
+            spaces,
+            lambda pid: (
+                "────────\n❯ \n────────\n⏵⏵ bypass on · 1 background agent"
+                if pid == "w6:p2"
+                else "────────\n❯ \n────────\n⏵⏵ bypass on"
+            ),
+        )
+        res_busy_bg = find_matching_spaces(verified_spaces, ticket="CBRD-10003")
+        self.assertEqual([m.space.workspace_id for m in res_busy_bg.matches], ["w6"])
+        self.assertEqual(res_busy_bg.recommendation, "warn_busy")
 
         # Default exclusions of self (w4) and deleted (w3), and opt-in flags.
         self.assertFalse(find_matching_spaces(spaces, label="herdr-spaces-status").found)

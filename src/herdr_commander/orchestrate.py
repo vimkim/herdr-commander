@@ -18,6 +18,7 @@ from .models import (
     DEFAULT_MAX_WORKER_PANES,
     EXIT_DOMAIN,
     EXIT_USAGE,
+    VALID_ON_EXISTING_POLICIES,
     VALID_SPLIT_DIRECTIONS,
     CallerContext,
     CliError,
@@ -39,8 +40,11 @@ from .models import (
 )
 from .snapshot import (
     collect_live_agent_names,
+    compute_find_recommendation,
     count_session_working_agents,
     count_workspace_non_primary_agents,
+    find_matching_spaces,
+    is_primary_exact_match,
     parse_snapshot,
     parse_workspace_tabs,
     resolve_pane_target,
@@ -313,33 +317,6 @@ def sanitize_agent_name(
     return f"{fallback}-{int(time.time()) % 10000}"
 
 
-def _find_matching_space(
-    spaces: Sequence[SpaceSnapshot],
-    *,
-    label: str | None,
-    norm_cwd: str | None,
-    norm_ticket: str | None,
-) -> SpaceSnapshot | None:
-    if label:
-        for space in spaces:
-            if space.label == label:
-                return space
-    if norm_ticket:
-        for space in spaces:
-            if space.ticket_key == norm_ticket and space.label == norm_ticket:
-                return space
-        for space in spaces:
-            if space.ticket_key == norm_ticket:
-                return space
-    if norm_cwd:
-        for space in spaces:
-            if space.primary_pane and space.primary_pane.cwd:
-                pane_cwd = os.path.normpath(os.path.abspath(space.primary_pane.cwd))
-                if pane_cwd == norm_cwd:
-                    return space
-    return None
-
-
 def _single_agent(spec: LauncherSpec) -> str | None:
     return spec.expected_agents[0] if len(spec.expected_agents) == 1 else None
 
@@ -366,7 +343,13 @@ def plan_ensure(
     pr_number: str | None,
     launcher_name: str,
     base_ref: str | None = None,
+    on_existing: str | None = None,
     force_new: bool = False,
+    reuse_target: str | None = None,
+    panes_by_workspace: Mapping[str, Sequence[PaneInfo]] | None = None,
+    read_detection: Callable[[str], str] | None = None,
+    home_dir: str | None = None,
+    realpath_fn: Callable[[str], str] = os.path.realpath,
     existing_agent_names: set[str] | frozenset[str] = frozenset(),
     dir_exists: Callable[[str], bool] = os.path.isdir,
 ) -> EnsurePlan:
@@ -380,67 +363,163 @@ def plan_ensure(
             exit_code=EXIT_USAGE,
         )
 
-    source_count = sum(1 for item in (cwd, ticket, pr_number) if item)
-    if source_count > 1:
+    if on_existing is not None and on_existing not in VALID_ON_EXISTING_POLICIES:
         raise CliError(
-            "CONFLICTING_TARGET",
-            "Specify at most one of --cwd, --ticket, or --pr.",
-            "Pass a single workspace source option.",
+            "INVALID_ON_EXISTING",
+            f"Unsupported --on-existing policy {on_existing!r}.",
+            f"Choose one of: {', '.join(VALID_ON_EXISTING_POLICIES)}.",
             exit_code=EXIT_USAGE,
         )
-    if source_count == 0 and not label:
+    if force_new and on_existing is not None and on_existing != "new":
         raise CliError(
-            "MISSING_TARGET",
-            "Specify --label, --cwd, --ticket, or --pr.",
-            "Provide a target workspace or directory, e.g. `hcmd ensure --ticket CBRD-10002`.",
+            "CONFLICTING_POLICY",
+            f"Cannot combine --new with --on-existing {on_existing}.",
+            "Use either `--on-existing new` (or `--new`) or another `--on-existing` mode.",
             exit_code=EXIT_USAGE,
         )
+    policy = "new" if force_new else (on_existing or "reuse")
 
+    clean_reuse = reuse_target.strip() if reuse_target and reuse_target.strip() else None
+    existing: SpaceSnapshot | None = None
     norm_cwd: str | None = None
-    if cwd:
-        norm_cwd = os.path.normpath(os.path.abspath(os.path.expanduser(cwd)))
-        if not dir_exists(norm_cwd):
+    norm_ticket: str | None = None
+    norm_pr: str | None = None
+    derived_label = ""
+
+    if clean_reuse is not None:
+        if any((label, cwd, ticket, pr_number, base_ref)):
             raise CliError(
-                "CWD_NOT_FOUND",
-                f"Target directory does not exist: {norm_cwd}",
-                "Pass an existing directory to --cwd, or use --ticket for CUBRID worktrees.",
-                exit_code=EXIT_DOMAIN,
+                "CONFLICTING_TARGET",
+                "--reuse cannot be combined with --label, --cwd, --ticket, --pr, or --base.",
+                "Pass `--reuse <workspace>` with `--launcher` only.",
+                exit_code=EXIT_USAGE,
+            )
+        if policy != "reuse":
+            raise CliError(
+                "CONFLICTING_POLICY",
+                f"--reuse cannot be combined with --on-existing {policy}.",
+                "Remove `--new` / `--on-existing` when passing `--reuse`.",
+                exit_code=EXIT_USAGE,
+            )
+        existing = resolve_target(spaces, clean_reuse)
+    else:
+        source_count = sum(1 for item in (cwd, ticket, pr_number) if item)
+        if source_count > 1:
+            raise CliError(
+                "CONFLICTING_TARGET",
+                "Specify at most one of --cwd, --ticket, or --pr.",
+                "Pass a single workspace source option.",
+                exit_code=EXIT_USAGE,
+            )
+        if source_count == 0 and not label:
+            raise CliError(
+                "MISSING_TARGET",
+                "Specify --label, --cwd, --ticket, --pr, or --reuse.",
+                "Provide a target workspace or directory, e.g. `hcmd ensure --ticket CBRD-10002`.",
+                exit_code=EXIT_USAGE,
             )
 
-    norm_ticket = ticket.strip().upper() if ticket else None
-    norm_pr = pr_number.strip().lstrip("#") if pr_number else None
-    if norm_pr and not norm_pr.isdigit():
-        raise CliError(
-            "INVALID_PR",
-            f"PR identifier must be a number, got {pr_number!r}.",
-            "Pass a numeric PR ID such as `--pr 1234`.",
-            exit_code=EXIT_USAGE,
-        )
-    if force_new and (norm_ticket or norm_pr):
-        raise CliError(
-            "NEW_UNSUPPORTED_FOR_WORKTREE",
-            (
-                "--new cannot be used with --ticket or --pr because CUBRID worktrees "
-                "map 1:1 to a ticket or PR."
-            ),
-            (
-                "Pass `--cwd <worktree-path> --label <new-label> --new` to open an "
-                "additional workspace in that directory."
-            ),
-            exit_code=EXIT_USAGE,
-        )
+        if cwd:
+            norm_cwd = os.path.normpath(os.path.abspath(os.path.expanduser(cwd)))
+            if not dir_exists(norm_cwd):
+                raise CliError(
+                    "CWD_NOT_FOUND",
+                    f"Target directory does not exist: {norm_cwd}",
+                    "Pass an existing directory to --cwd, or use --ticket for CUBRID worktrees.",
+                    exit_code=EXIT_DOMAIN,
+                )
 
-    derived_label = label or norm_ticket or (f"PR-{norm_pr}" if norm_pr else Path(norm_cwd).name)
-    existing = (
-        None
-        if force_new
-        else _find_matching_space(
-            spaces,
-            label=label,
-            norm_cwd=norm_cwd,
-            norm_ticket=norm_ticket,
+        norm_ticket = ticket.strip().upper() if ticket else None
+        norm_pr = pr_number.strip().lstrip("#") if pr_number else None
+        if norm_pr and not norm_pr.isdigit():
+            raise CliError(
+                "INVALID_PR",
+                f"PR identifier must be a number, got {pr_number!r}.",
+                "Pass a numeric PR ID such as `--pr 1234`.",
+                exit_code=EXIT_USAGE,
+            )
+        if policy == "new" and (norm_ticket or norm_pr):
+            raise CliError(
+                "NEW_UNSUPPORTED_FOR_WORKTREE",
+                (
+                    "--new cannot be used with --ticket or --pr because CUBRID worktrees "
+                    "map 1:1 to a ticket or PR."
+                ),
+                (
+                    "Pass `--cwd <worktree-path> --label <new-label> --on-existing new` to open "
+                    "an additional workspace in that directory."
+                ),
+                exit_code=EXIT_USAGE,
+            )
+
+        derived_label = (
+            label or norm_ticket or (f"PR-{norm_pr}" if norm_pr else Path(norm_cwd).name)
         )
-    )
+        if policy == "fail":
+            find_result = find_matching_spaces(
+                spaces,
+                label=derived_label,
+                cwd=norm_cwd,
+                ticket=norm_ticket,
+                pr_number=norm_pr,
+                include_self=False,
+                include_deleted=False,
+                panes_by_workspace=panes_by_workspace,
+                home_dir=home_dir,
+                realpath_fn=realpath_fn,
+            )
+            if find_result.found:
+                if read_detection is not None:
+                    verified_spaces = verify_claude_busy(
+                        [m.space for m in find_result.matches], read_detection
+                    )
+                    updated_matches = tuple(
+                        replace(m, space=s)
+                        for m, s in zip(find_result.matches, verified_spaces, strict=True)
+                    )
+                    find_result = replace(
+                        find_result,
+                        matches=updated_matches,
+                        recommendation=compute_find_recommendation(updated_matches),
+                    )
+                summary_items = []
+                for match in find_result.matches[:3]:
+                    pane = match.space.primary_pane
+                    agent_str = pane.agent_kind or "shell" if pane else "-"
+                    status_str = pane.effective_status if pane else "none"
+                    summary_items.append(
+                        f"{match.space.workspace_id}:{match.space.label} [{agent_str}:{status_str}]"
+                    )
+                summary = ", ".join(summary_items)
+                raise CliError(
+                    "EXISTING_WORKSPACE_FOUND",
+                    (
+                        f"Found {len(find_result.matches)} existing workspace(s) "
+                        f"(recommendation={find_result.recommendation}): {summary}."
+                    ),
+                    (
+                        "Ask the user whether to reuse an existing workspace "
+                        "(`hcmd ensure --reuse <workspace_id>` or `hcmd send <workspace_id>`), "
+                        "or create a new one with `--on-existing new`."
+                    ),
+                    exit_code=EXIT_DOMAIN,
+                    details=find_result.to_dict(),
+                )
+        elif policy == "reuse":
+            find_result = find_matching_spaces(
+                spaces,
+                label=label,
+                cwd=norm_cwd,
+                ticket=norm_ticket,
+                pr_number=norm_pr,
+                include_self=False,
+                include_deleted=False,
+                panes_by_workspace=panes_by_workspace,
+                home_dir=home_dir,
+                realpath_fn=realpath_fn,
+            )
+            first_exact = next((m for m in find_result.matches if is_primary_exact_match(m)), None)
+            existing = first_exact.space if first_exact is not None else None
 
     if existing is not None:
         pane = existing.primary_pane
@@ -648,12 +727,16 @@ def _locate_ensured_space(
     norm_cwd = os.path.normpath(os.path.abspath(cwd)) if isinstance(cwd, str) and cwd else None
     ticket = created_meta.get("ticket") or plan.ticket
     norm_ticket = ticket.upper() if isinstance(ticket, str) and ticket else None
-    return _find_matching_space(
+    found = find_matching_spaces(
         spaces,
-        label=plan.label,
-        norm_cwd=norm_cwd,
-        norm_ticket=norm_ticket,
+        label=plan.label or None,
+        cwd=norm_cwd,
+        ticket=norm_ticket,
+        pr_number=plan.pr_number,
+        include_self=True,
+        include_deleted=True,
     )
+    return found.matches[0].space if found.matches else None
 
 
 def _wait_for_launched_agent(

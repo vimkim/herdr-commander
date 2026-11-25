@@ -57,6 +57,7 @@ from .models import (
     EXIT_OK,
     EXIT_SIGINT,
     EXIT_USAGE,
+    VALID_ON_EXISTING_POLICIES,
     VALID_SORT_MODES,
     VALID_SPLIT_DIRECTIONS,
     VALID_WAIT_STATES,
@@ -85,6 +86,7 @@ from .orchestrate import (
 from .snapshot import (
     collect_live_agent_names,
     collect_workspace_panes,
+    compute_find_recommendation,
     correlate_work_tracker,
     count_session_working_agents,
     filter_spaces,
@@ -114,7 +116,7 @@ Examples:
   hcmd find --label my-repo --cwd ~/gh/my-repo --verify-busy --json
   hcmd peek w1 --lines 40
   hcmd wait --until blocked,done --timeout 300 --verify-busy --json
-  hcmd ensure --ticket CBRD-10002 --launcher ai-agent --json
+  hcmd ensure --ticket CBRD-10002 --on-existing fail --launcher ai-agent --json
   hcmd send w1 --prompt "Summarize findings in tab 1." --json
 """
 
@@ -300,14 +302,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Idempotently ensure a workspace and first-tab agent are running",
     )
     p_ensure.add_argument("--label", help="Workspace label")
-    p_ensure.add_argument("--cwd", help="Existing directory for a non-CUBRID workspace")
+    p_ensure.add_argument(
+        "--cwd",
+        "--pwd",
+        dest="cwd",
+        help="Existing directory for a non-CUBRID workspace (alias: --pwd)",
+    )
     p_ensure.add_argument("--ticket", help="CUBRID JIRA ticket key (e.g. CBRD-10002)")
     p_ensure.add_argument("--pr", help="CUBRID PR number for review worktree")
     p_ensure.add_argument("--base", help="Base ref for `cubrid-worktree create --base`")
     p_ensure.add_argument(
+        "--on-existing",
+        choices=VALID_ON_EXISTING_POLICIES,
+        default=None,
+        help=(
+            "Policy when a matching workspace exists: reuse (default), fail "
+            "(return EXISTING_WORKSPACE_FOUND with candidates), or new "
+            "(create a fresh cwd workspace)"
+        ),
+    )
+    p_ensure.add_argument(
+        "--reuse",
+        metavar="TARGET",
+        help="Explicitly reuse an existing workspace ID, label, or ticket and ensure its agent",
+    )
+    p_ensure.add_argument(
         "--new",
         action="store_true",
-        help="Create a new cwd workspace even if a matching workspace already exists",
+        help="Shorthand for `--on-existing new`",
     )
     p_ensure.add_argument(
         "--launcher",
@@ -861,12 +883,14 @@ def _dispatch(
                     if mode.fmt != "json":
                         sys.stderr.write(f"Warning: {warn}\n")
                 matched_spaces = correlate_work_tracker(matched_spaces, items)
+            updated_matches = tuple(
+                replace(match, space=space)
+                for match, space in zip(result.matches, matched_spaces, strict=True)
+            )
             result = replace(
                 result,
-                matches=tuple(
-                    replace(match, space=space)
-                    for match, space in zip(result.matches, matched_spaces, strict=True)
-                ),
+                matches=updated_matches,
+                recommendation=compute_find_recommendation(updated_matches),
             )
         return format_find(result, mode, warnings=warnings)
 
@@ -938,6 +962,7 @@ def _dispatch(
             )
         raw_snap = client.snapshot()
         spaces = parse_snapshot(raw_snap, self_workspace_id=self_workspace_id)
+        panes_by_workspace = collect_workspace_panes(raw_snap)
         plan = plan_ensure(
             spaces,
             label=ns.label,
@@ -946,7 +971,11 @@ def _dispatch(
             pr_number=ns.pr,
             launcher_name=ns.launcher,
             base_ref=ns.base,
+            on_existing=ns.on_existing,
             force_new=bool(ns.new),
+            reuse_target=ns.reuse,
+            panes_by_workspace=panes_by_workspace,
+            read_detection=client.read_detection,
             existing_agent_names=collect_live_agent_names(raw_snap),
         )
         result = execute_ensure(

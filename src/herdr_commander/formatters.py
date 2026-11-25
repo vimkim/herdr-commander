@@ -399,9 +399,22 @@ def format_find(
         lines.append("  ".join(row_parts))
 
     lines.append("")
-    lines.append(
-        "Tip: Ask the user whether to reuse an existing workspace above before creating a new one."
-    )
+    if result.recommendation == "warn_busy":
+        lines.append(
+            "Warning: At least one matched workspace is busy or blocked. "
+            "Ask the user whether to wait, inspect it, use a sub-tab, or create a new workspace."
+        )
+    elif result.recommendation == "reuse_empty_shell":
+        lines.append(
+            "Tip: An empty shell workspace already exists for this target. "
+            "Ask the user whether to launch an agent there (`hcmd ensure --reuse <ws>`) "
+            "or create a new one."
+        )
+    else:
+        lines.append(
+            "Tip: Ask the user whether to reuse an existing workspace above "
+            "(`hcmd ensure --reuse <ws>` / `hcmd send <ws>`) before creating a new one."
+        )
     return "\n".join(lines)
 
 

@@ -335,10 +335,26 @@ class CliContractTests(unittest.TestCase):
                 )
                 self.assertEqual(busy_proc.returncode, 0, busy_proc.stderr)
                 busy_data = json.loads(busy_proc.stdout)["data"]
+                self.assertEqual(busy_data["recommendation"], "warn_busy")
                 self.assertEqual(
                     busy_data["matches"][0]["workspace"]["primary_pane"]["effective_status"],
                     "busy_bg",
                 )
+
+                shell_proc = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "find",
+                        "--ticket",
+                        "CBRD-10002",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(shell_proc.returncode, 0, shell_proc.stderr)
+                shell_data = json.loads(shell_proc.stdout)["data"]
+                self.assertEqual(shell_data["recommendation"], "reuse_empty_shell")
 
                 miss_proc = run_cli(
                     [
@@ -424,6 +440,110 @@ class CliContractTests(unittest.TestCase):
                 self.assertEqual(err_proc.stdout, "")
                 err_payload = json.loads(err_proc.stderr.strip().splitlines()[-1])
                 self.assertEqual(err_payload["error"]["code"], "MISSING_QUERY")
+
+    def test_ensure_on_existing_fail_and_reuse_via_socket(self) -> None:
+        snapshot = copy.deepcopy(json.loads(FIXTURE_PATH.read_text(encoding="utf-8")))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            live_dir = Path(tmpdir) / "demo-skills"
+            live_dir.mkdir()
+            for item in (*snapshot["panes"], *snapshot["agents"]):
+                if item["workspace_id"] == "w2":
+                    item["cwd"] = str(live_dir)
+                    if "foreground_cwd" in item:
+                        item["foreground_cwd"] = str(live_dir)
+                elif item["workspace_id"] != "w3":
+                    other_dir = Path(tmpdir) / item["workspace_id"]
+                    other_dir.mkdir(exist_ok=True)
+                    item["cwd"] = str(other_dir)
+                    if "foreground_cwd" in item:
+                        item["foreground_cwd"] = str(other_dir)
+
+            sock_path = Path(tmpdir) / "herdr.sock"
+            with MockHerdrServer(sock_path, snapshot):
+                fail_busy = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "ensure",
+                        "--ticket",
+                        "CBRD-10003",
+                        "--on-existing",
+                        "fail",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(fail_busy.returncode, 1)
+                self.assertEqual(fail_busy.stdout, "")
+                busy_err = json.loads(fail_busy.stderr.strip().splitlines()[-1])["error"]
+                self.assertEqual(busy_err["code"], "EXISTING_WORKSPACE_FOUND")
+                self.assertEqual(busy_err["details"]["recommendation"], "warn_busy")
+                self.assertEqual(
+                    busy_err["details"]["matches"][0]["workspace"]["primary_pane"][
+                        "effective_status"
+                    ],
+                    "busy_bg",
+                )
+
+                fail_shell = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "ensure",
+                        "--ticket",
+                        "CBRD-10002",
+                        "--on-existing",
+                        "fail",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(fail_shell.returncode, 1)
+                shell_err = json.loads(fail_shell.stderr.strip().splitlines()[-1])["error"]
+                self.assertEqual(shell_err["details"]["recommendation"], "reuse_empty_shell")
+
+                reuse_proc = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "ensure",
+                        "--reuse",
+                        "w2",
+                        "--launcher",
+                        "ai-agent",
+                        "--dry-run",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(reuse_proc.returncode, 0, reuse_proc.stderr)
+                reuse_data = json.loads(reuse_proc.stdout)["data"]
+                self.assertEqual(reuse_data["workspace_action"], "reuse")
+                self.assertEqual(reuse_data["agent_action"], "reuse")
+                self.assertEqual(reuse_data["workspace_id"], "w2")
+
+                new_proc = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "ensure",
+                        "--pwd",
+                        str(live_dir),
+                        "--label",
+                        "demo-skills-2",
+                        "--on-existing",
+                        "new",
+                        "--launcher",
+                        "shell",
+                        "--dry-run",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(new_proc.returncode, 0, new_proc.stderr)
+                new_data = json.loads(new_proc.stdout)["data"]
+                self.assertEqual(new_data["workspace_action"], "create_cwd")
+                self.assertEqual(new_data["label"], "demo-skills-2")
 
 
 if __name__ == "__main__":

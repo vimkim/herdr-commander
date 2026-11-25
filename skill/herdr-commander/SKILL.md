@@ -68,7 +68,16 @@ Before dispatching several workspaces at once, check quota with `ai-agent --dry-
 
 ## 3. Check existing workspaces before launching
 
-Before calling `hcmd ensure` or opening any new workspace, **always** check whether a matching Herdr workspace is already open for the target name, label, pwd/cwd, ticket, or PR:
+Before opening or dispatching any workspace, **always** enforce the pre-launch check:
+
+- **Single-task dispatch (fail-closed single step)**: call `ensure` with `--on-existing fail`. If no matching workspace exists, it creates and starts the workspace immediately. If a match exists, it stops safely with `EXISTING_WORKSPACE_FOUND` and returns `error.details.recommendation` + `error.details.matches`:
+
+```bash
+hcmd ensure --ticket CBRD-10002 --on-existing fail --launcher ai-agent --json
+hcmd ensure --cwd ~/gh/my-project --label my-project --on-existing fail --launcher ai-agent --json
+```
+
+- **Multi-task / batch dispatch**: run `hcmd find ... --verify-busy --json` across all planned tasks first so every matching workspace is collected before creating anything, then present **all** matched items to the user in **one grouped summary table** and ask once:
 
 ```bash
 hcmd find --label my-project --cwd ~/gh/my-project --verify-busy --json
@@ -76,24 +85,27 @@ hcmd find --ticket CBRD-10002 --verify-busy --json
 hcmd find --name demo-lead --verify-busy --json
 ```
 
-Pass every known identifier (`--name`, `--label`, `--cwd` / `--pwd`, `--ticket`, `--pr`) so exact and partial matches on workspace labels, primary/sub-pane agent names, working directories, tickets, and PRs are all checked.
+Handle each `recommendation` (`data.recommendation` from `find`, or `error.details.recommendation` from `EXISTING_WORKSPACE_FOUND`, unless the user already explicitly named that exact workspace to reuse in this turn):
 
-- **When `data.found` is `true` (`recommendation == "ask_reuse"`)**:
-  - **Stop before calling `hcmd ensure` or `hcmd send`** (unless the user already explicitly asked in this turn to reuse or send to that exact workspace).
-  - Present each matched workspace with its live Herdr location (workspace label, primary tab label + `primary_tab_id`, `pane_id`), agent kind and `effective_status` / `attention` (plus `sub_tabs` if active), `cwd`, and `match_reasons`.
-  - **Propose delegating to the existing workspace and ask the user**, for example:
-    `"이미 <label> (tab <primary_tab_label> (<primary_tab_id>), pane <pane_id>, <agent_kind>:<effective_status>, cwd <cwd>) 워크스페이스가 띄워져 있습니다. 거기에 맡길까요, 아니면 새 워크스페이스를 띄울까요?"`
-  - If the user chooses to **reuse**: dispatch with `hcmd send <ws>` (if the workspace is an empty shell, run `hcmd ensure` first; if `working`/`busy_bg` or `blocked`, coordinate or surface the blocker before sending).
-  - If the user chooses to **create new**: run `hcmd ensure --cwd <dir> --label <new-label> --new --launcher ai-agent --json`.
-- **When `data.found` is `false` (`recommendation == "create_new"`)**: proceed directly to Step 4.
+- `create_new`: no matching workspace exists; proceed directly to Step 4 (`ensure` already ran if using `--on-existing fail`).
+- `warn_busy`: at least one matched workspace (or its sub-tabs) is `working`, `busy_bg`, or `blocked`. Report its Herdr location (`label`, `tab <primary_tab_label> (<primary_tab_id>)`, `pane <pane_id>`, `agent:status`, `cwd`, `match_reasons`), warn that work is currently active or blocked, and ask the user whether to wait, inspect with `hcmd peek <ws>`, attach a sub-tab, or create a new workspace (`--on-existing new`).
+- `ask_reuse`: an existing agent (`idle` / `done`) or multiple candidate workspaces match. Present each match's live Herdr location, agent kind/status, `cwd`, and `match_reasons`, and propose reusing it vs creating new—for example:
+  `"이미 <label> (tab <primary_tab_label> (<primary_tab_id>), pane <pane_id>, <agent_kind>:<effective_status>, cwd <cwd>) 워크스페이스가 띄워져 있습니다. 거기에 맡길까요, 아니면 새 워크스페이스를 띄울까요?"`
+- `reuse_empty_shell`: an exact matching workspace exists with only an empty shell (`agent_kind: null`). Report its Herdr location and ask whether to launch an agent inside it (`hcmd ensure --reuse <ws> --launcher ai-agent --json`) or create a new workspace (`--on-existing new`).
+
+Follow-up after user choice:
+
+- **Reuse**: send directly with `hcmd send <ws>` when an agent is ready, or run `hcmd ensure --reuse <ws> --launcher ai-agent --json` to launch an agent in an empty shell / confirm readiness.
+- **Create new**: run `hcmd ensure --cwd <dir> --label <new-label> --on-existing new --launcher ai-agent --json`.
 
 ## 4. Ensure workspaces and brief Tab 1
 
-Run `ensure` for each new or user-confirmed task. It reuses matching open workspaces (unless `--new` is passed for a `--cwd` workspace), creates CUBRID worktrees via `cubrid-worktree` or general directories via `herdr-next-to-current`, and waits until the first-tab agent is ready.
+Run `ensure` with `--on-existing fail` for new tasks, or `--reuse <ws>` / `--on-existing new` after user confirmation. `ensure` delegates CUBRID worktrees to `cubrid-worktree` and general directories to `herdr-next-to-current`, then waits until the first-tab agent is ready.
 
 ```bash
-hcmd ensure --ticket CBRD-10002 --launcher ai-agent --json
-hcmd ensure --cwd ~/gh/my-project --label my-project --launcher ai-agent --json
+hcmd ensure --ticket CBRD-10002 --on-existing fail --launcher ai-agent --json
+hcmd ensure --reuse w2 --launcher ai-agent --json
+hcmd ensure --cwd ~/gh/my-project --label my-project-2 --on-existing new --launcher ai-agent --json
 ```
 
 If `ensure` exits with `OCCUPIED_BY_OTHER_AGENT`, inspect the workspace with `hcmd peek <ws>` instead of overwriting the pane.

@@ -33,6 +33,7 @@ DEFAULT_MAX_SPACE_AGENTS = 4
 DEFAULT_MAX_SESSION_AGENTS = 10
 
 VALID_SPLIT_DIRECTIONS = ("auto", "right", "down")
+VALID_ON_EXISTING_POLICIES = ("reuse", "fail", "new")
 
 
 class CliError(Exception):
@@ -527,7 +528,7 @@ class FindResult:
 
     query: FindQuery
     found: bool
-    recommendation: str  # "ask_reuse" | "create_new"
+    recommendation: str  # "create_new" | "reuse_empty_shell" | "ask_reuse" | "warn_busy"
     matches: tuple[WorkspaceMatch, ...]
 
     def to_dict(self) -> dict[str, Any]:

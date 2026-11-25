@@ -38,7 +38,11 @@ hcmd find demo-lead --json
 ```
 
 - Supports positional `query` and explicit `--name`, `--label`, `--cwd` / `--pwd`, `--ticket`, and `--pr` filters, plus `--verify-busy`, `--with-tracker`, `--include-self`, and `--include-deleted`.
-- Exits `0` both when matches are found (`found: true`, `recommendation: "ask_reuse"`) and when none match (`found: false`, `recommendation: "create_new"`).
+- Exits `0` both when matches are found (`found: true`) and when none match (`found: false`), reporting a state-aware `recommendation`:
+  - `create_new`: no matching workspace exists.
+  - `reuse_empty_shell`: single exact primary match running an empty shell (`agent_kind: null`).
+  - `ask_reuse`: idle/done agent match or multiple candidate workspaces.
+  - `warn_busy`: at least one matched workspace (or its sub-tabs) is `working`, `busy_bg`, or `blocked`.
 - Matches workspace labels, primary and sub-pane agent names, primary/foreground/sub-pane working directories (including symlinks and subdirectories under the target directory), tickets, and PR tokens while excluding `is_self` and `deleted_hint` workspaces by default.
 
 ### `peek`
@@ -63,8 +67,9 @@ hcmd wait --until blocked,done --timeout 300 --verify-busy --json
 Idempotently converge a workspace and its first-tab agent:
 
 ```bash
-hcmd ensure --ticket CBRD-10002 --launcher ai-agent --dry-run --json
-hcmd ensure --cwd ~/gh/my-repo --label my-repo --launcher ai-agent --json
+hcmd ensure --ticket CBRD-10002 --on-existing fail --launcher ai-agent --json
+hcmd ensure --reuse w2 --launcher ai-agent --json
+hcmd ensure --cwd ~/gh/my-repo --pwd ~/gh/my-repo --label my-repo --on-existing new --launcher ai-agent --json
 ```
 
 | Launcher | Herdr agent kind | Notes |
@@ -77,7 +82,11 @@ hcmd ensure --cwd ~/gh/my-repo --label my-repo --launcher ai-agent --json
 | `shell` | none | Workspace only, no agent. |
 
 - `ai-agent` runs `ai-agent --dry-run --json` before creating a workspace. `--dry-run` reports the predicted agent kind, and a quota failure such as `AI_AGENT_NO_ELIGIBLE_BACKEND` stops before any worktree is created. Either `agy` or `claude` in the first tab counts as a match for reuse and readiness.
-- Reuses matching open workspaces and matching running first-tab agents (pass `--new` with `--cwd` to create a fresh workspace instead of reusing an existing one).
+- Uses the same `find_matching_spaces` matcher as `hcmd find`, controlled by `--on-existing {reuse,fail,new}`:
+  - `reuse` (default): reuses an exact primary match and matching first-tab agent.
+  - `fail`: aborts before creating or reusing (`EXISTING_WORKSPACE_FOUND`) and returns `recommendation` + `matches` (with Claude `busy_bg` verification) in `error.details`.
+  - `new` (or shorthand `--new`): creates a fresh `--cwd`/`--pwd` workspace even when a matching workspace exists.
+- `--reuse <target>` explicitly targets an existing workspace ID, label, or ticket to ensure/launch its first-tab agent.
 - Delegates `--ticket` and `--pr` workspace creation to `cubrid-worktree` and `--cwd` creation to `herdr-next-to-current` or `herdr workspace create --no-focus`.
 - Refuses to overwrite a first-tab pane already occupied by a different agent kind (`OCCUPIED_BY_OTHER_AGENT`).
 

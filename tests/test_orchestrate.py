@@ -11,7 +11,7 @@ from unittest.mock import patch
 from herdr_commander.cli import _dispatch, build_parser
 from herdr_commander.formatters import OutputMode
 from herdr_commander.herdr_client import ai_agent_select_backend
-from herdr_commander.models import EXIT_CONFIG, CliError
+from herdr_commander.models import EXIT_CONFIG, EXIT_DOMAIN, EXIT_USAGE, CliError
 from herdr_commander.orchestrate import (
     LAUNCHERS,
     build_agent_start_args,
@@ -23,7 +23,7 @@ from herdr_commander.orchestrate import (
     sanitize_agent_name,
     validate_send,
 )
-from herdr_commander.snapshot import parse_snapshot
+from herdr_commander.snapshot import collect_workspace_panes, parse_snapshot
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "snapshot_sample.json"
 
@@ -302,6 +302,169 @@ class OrchestrateTests(unittest.TestCase):
                     **kwargs,
                 )
             self.assertEqual(err.exception.code, "NEW_UNSUPPORTED_FOR_WORKTREE")
+
+    def test_plan_ensure_on_existing_fail_reuse_and_matcher_unification(self) -> None:
+        raw = load_fixture()
+        spaces = parse_snapshot(raw, self_workspace_id="w4", path_exists=lambda _p: True)
+        panes_by_ws = collect_workspace_panes(raw, path_exists=lambda _p: True)
+
+        # on_existing="fail" surfaces structured EXISTING_WORKSPACE_FOUND with busy_bg verification.
+        with self.assertRaises(CliError) as busy_err:
+            plan_ensure(
+                spaces,
+                label=None,
+                cwd=None,
+                ticket="CBRD-10003",
+                pr_number=None,
+                launcher_name="ai-agent",
+                on_existing="fail",
+                panes_by_workspace=panes_by_ws,
+                read_detection=lambda pid: (
+                    "────────\n❯ \n────────\n⏵⏵ bypass on · 1 background agent"
+                    if pid == "w6:p2"
+                    else "────────\n❯ \n────────\n⏵⏵ bypass on"
+                ),
+            )
+        self.assertEqual(busy_err.exception.code, "EXISTING_WORKSPACE_FOUND")
+        self.assertEqual(busy_err.exception.exit_code, EXIT_DOMAIN)
+        assert busy_err.exception.details is not None
+        self.assertTrue(busy_err.exception.details["found"])
+        self.assertEqual(busy_err.exception.details["count"], 1)
+        self.assertEqual(busy_err.exception.details["recommendation"], "warn_busy")
+        self.assertEqual(
+            busy_err.exception.details["matches"][0]["workspace"]["primary_pane"][
+                "effective_status"
+            ],
+            "busy_bg",
+        )
+
+        # Derived label / sub-pane cwd match also triggers on_existing="fail".
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sub_dir = Path(tmpdir) / "sub-repo"
+            sub_dir.mkdir()
+            raw_sub = copy.deepcopy(raw)
+            for item in (*raw_sub["panes"], *raw_sub["agents"]):
+                if item["pane_id"] == "w1:p2":
+                    item["cwd"] = str(sub_dir)
+                    if "foreground_cwd" in item:
+                        item["foreground_cwd"] = str(sub_dir)
+            spaces_sub = parse_snapshot(
+                raw_sub, self_workspace_id="w4", path_exists=lambda _p: True
+            )
+            panes_sub = collect_workspace_panes(raw_sub, path_exists=lambda _p: True)
+
+            with self.assertRaises(CliError) as sub_err:
+                plan_ensure(
+                    spaces_sub,
+                    label=None,
+                    cwd=str(sub_dir),
+                    ticket=None,
+                    pr_number=None,
+                    launcher_name="ai-agent",
+                    on_existing="fail",
+                    panes_by_workspace=panes_sub,
+                    home_dir=tmpdir,
+                )
+            self.assertEqual(sub_err.exception.code, "EXISTING_WORKSPACE_FOUND")
+            assert sub_err.exception.details is not None
+            self.assertIn(
+                "sub_pane_cwd_exact",
+                sub_err.exception.details["matches"][0]["match_reasons"],
+            )
+
+        # on_existing="fail" proceeds to create when no workspace matches.
+        fresh_plan = plan_ensure(
+            spaces,
+            label=None,
+            cwd=None,
+            ticket="CBRD-10009",
+            pr_number=None,
+            launcher_name="ai-agent",
+            on_existing="fail",
+            panes_by_workspace=panes_by_ws,
+        )
+        self.assertEqual(fresh_plan.workspace_action, "create_cubrid_ticket")
+        self.assertEqual(fresh_plan.agent_action, "launch")
+
+        # Partial substring label must NOT auto-reuse under "reuse", but DOES fail under "fail".
+        partial_create = plan_ensure(
+            spaces,
+            label="demo",
+            cwd=None,
+            ticket=None,
+            pr_number=None,
+            launcher_name="shell",
+            on_existing="reuse",
+            panes_by_workspace=panes_by_ws,
+        )
+        self.assertEqual(partial_create.workspace_action, "create_cwd")
+
+        with self.assertRaises(CliError) as partial_fail:
+            plan_ensure(
+                spaces,
+                label="demo",
+                cwd=None,
+                ticket=None,
+                pr_number=None,
+                launcher_name="shell",
+                on_existing="fail",
+                panes_by_workspace=panes_by_ws,
+            )
+        self.assertEqual(partial_fail.exception.code, "EXISTING_WORKSPACE_FOUND")
+
+        # Explicit --reuse targets an existing workspace directly and rejects conflicting flags.
+        reuse_shell = plan_ensure(
+            spaces,
+            label=None,
+            cwd=None,
+            ticket=None,
+            pr_number=None,
+            launcher_name="ay",
+            reuse_target="w5",
+        )
+        self.assertEqual(reuse_shell.workspace_action, "reuse")
+        self.assertEqual(reuse_shell.agent_action, "launch")
+        self.assertEqual(reuse_shell.existing_workspace_id, "w5")
+
+        with self.assertRaises(CliError) as reuse_target_err:
+            plan_ensure(
+                spaces,
+                label=None,
+                cwd=None,
+                ticket="CBRD-10002",
+                pr_number=None,
+                launcher_name="ay",
+                reuse_target="w5",
+            )
+        self.assertEqual(reuse_target_err.exception.code, "CONFLICTING_TARGET")
+        self.assertEqual(reuse_target_err.exception.exit_code, EXIT_USAGE)
+
+        with self.assertRaises(CliError) as reuse_policy_err:
+            plan_ensure(
+                spaces,
+                label=None,
+                cwd=None,
+                ticket=None,
+                pr_number=None,
+                launcher_name="ay",
+                reuse_target="w5",
+                on_existing="new",
+            )
+        self.assertEqual(reuse_policy_err.exception.code, "CONFLICTING_POLICY")
+        self.assertEqual(reuse_policy_err.exception.exit_code, EXIT_USAGE)
+
+        with self.assertRaises(CliError) as conflict_policy_err:
+            plan_ensure(
+                spaces,
+                label="demo",
+                cwd=None,
+                ticket=None,
+                pr_number=None,
+                launcher_name="shell",
+                on_existing="fail",
+                force_new=True,
+            )
+        self.assertEqual(conflict_policy_err.exception.code, "CONFLICTING_POLICY")
 
 
 def _append_workspace(

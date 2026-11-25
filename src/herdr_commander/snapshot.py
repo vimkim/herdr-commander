@@ -874,6 +874,41 @@ _SUB_PANE_EXACT_REASONS = frozenset(
 _EXACT_MATCH_REASONS = _PRIMARY_EXACT_REASONS | _SUB_PANE_EXACT_REASONS
 
 
+def is_primary_exact_match(match: WorkspaceMatch) -> bool:
+    """Return True when a match includes at least one exact primary-space reason."""
+    return any(reason in _PRIMARY_EXACT_REASONS for reason in match.match_reasons)
+
+
+def _is_space_busy_or_blocked(space: SpaceSnapshot) -> bool:
+    pane = space.primary_pane
+    if pane is not None and pane.effective_status in {"working", "busy_bg", "blocked"}:
+        return True
+    return (
+        space.attention in {"working", "blocked"}
+        or space.sub_tabs.any_working
+        or space.sub_tabs.any_blocked
+    )
+
+
+def compute_find_recommendation(matches: Sequence[WorkspaceMatch]) -> str:
+    """Compute state-aware pre-launch recommendation from matched workspaces."""
+    if not matches:
+        return "create_new"
+    if any(_is_space_busy_or_blocked(m.space) for m in matches):
+        return "warn_busy"
+    if len(matches) == 1:
+        top = matches[0]
+        pane = top.space.primary_pane
+        if (
+            is_primary_exact_match(top)
+            and pane is not None
+            and pane.agent_kind is None
+            and pane.effective_status == "shell"
+        ):
+            return "reuse_empty_shell"
+    return "ask_reuse"
+
+
 def _normalize_path_candidates(
     path: str,
     realpath_fn: Callable[[str], str] = os.path.realpath,
@@ -1129,7 +1164,9 @@ def find_matching_spaces(
     matches.sort(
         key=lambda m: (
             0 if m.match_strength == "exact" else 1,
-            0 if any(r in _PRIMARY_EXACT_REASONS for r in m.match_reasons) else 1,
+            0 if is_primary_exact_match(m) else 1,
+            0 if "label_exact" in m.match_reasons else 1,
+            0 if (norm_ticket is not None and m.space.label.upper() == norm_ticket) else 1,
             -len(m.match_reasons),
             m.space.number,
             m.space.workspace_id,
@@ -1148,6 +1185,6 @@ def find_matching_spaces(
             include_deleted=include_deleted,
         ),
         found=bool(matches),
-        recommendation="ask_reuse" if matches else "create_new",
+        recommendation=compute_find_recommendation(matches),
         matches=tuple(matches),
     )
