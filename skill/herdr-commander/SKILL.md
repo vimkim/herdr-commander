@@ -1,11 +1,15 @@
 ---
 name: herdr-commander
-description: Coordinate daily tasks across Herdr workspaces by managing each workspace's first-tab agent. Use when planning or dispatching parallel work into Herdr workspaces, launching ai-round, ai-best, ay, or codex in matching worktrees or directories, monitoring first-tab progress, or harvesting completed workspace results.
+description: Coordinate all tasks through Herdr workspaces and Herdr tabs by managing each workspace's first-tab agent. Use when acting as a Herdr commander to plan or dispatch work into Herdr workspaces, launch ai-round, ai-best, ay, or codex in matching worktrees or directories, monitor first-tab progress, or harvest completed workspace results.
 ---
 
 # Herdr Commander
 
-Act as the coordinator in your own Herdr workspace. Manage worker workspaces through their first tab while letting each first-tab agent spawn and control its own extra tabs inside that workspace.
+Act strictly as the coordinator in your own Herdr workspace. Execute **all** work through Herdr workspaces and Herdr tabs:
+
+- **All tasks run in Herdr workspaces + tabs**: Dispatch every piece of task work — implementation, debugging, investigation, code review, builds, tests, docs, or PR/CI work — into a Herdr workspace (Tab 1 via `hss ensure` and `hss send`) and its Herdr tabs. Never perform task work directly in the commander session or bypass Herdr with in-process subagents or swarms.
+- **Commander session scope**: Keep this session strictly on coordination — reconciling schedules and trackers, checking status, ensuring workspaces, sending briefs, waiting on events, peeking output, updating `work-tracker` / daily sheets, and reporting to the user.
+- **First-tab delegation, sub-tab autonomy**: Manage each worker workspace through its first tab (`tabs[0]`) and let that first-tab agent create and control extra Herdr tabs inside its workspace for parallel work, builds, tests, or helper agents.
 
 Delegate sibling concerns to existing skills rather than duplicating their rules.
 
@@ -67,7 +71,7 @@ Send the kickoff brief to Tab 1 via stdin so multiline text needs no shell escap
 hss send <ws> --prompt - --json <<'EOF'
 Objective: <concise goal and acceptance criteria>.
 Tracker ID: <work-tracker ID or none>.
-Workspace autonomy: Create and manage extra Herdr tabs in this workspace as needed for builds, tests, or helper agents.
+Workspace execution: Carry out all task work inside this Herdr workspace, using extra Herdr tabs in this workspace as needed for builds, tests, or helper agents.
 Reporting rule: Keep final findings, verification evidence (commits, test runs, PR or doc paths), and blockers summarized in this first tab.
 EOF
 ```

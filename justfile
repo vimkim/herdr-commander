@@ -13,14 +13,16 @@ sync:
     hss --help >/dev/null
     just install-skill
 
-# Symlink skill/herdr-commander into ~/.agents/skills and ~/.claude/skills.
+# Symlink skill/herdr-commander for shared agents, Claude, Codex, and Antigravity (agy).
 install-skill:
     #!/usr/bin/env bash
     set -euo pipefail
     src="{{justfile_directory()}}/skill/herdr-commander"
     agents_dir="$HOME/.agents/skills"
     claude_dir="$HOME/.claude/skills"
-    mkdir -p "$agents_dir" "$claude_dir"
+    codex_dir="${CODEX_HOME:-$HOME/.codex}/skills"
+    agy_dir="$HOME/.gemini/config/skills"
+    mkdir -p "$agents_dir" "$claude_dir" "$codex_dir" "$agy_dir"
 
     link_safe() {
         local target="$1"
@@ -35,6 +37,8 @@ install-skill:
 
     link_safe "$src" "$agents_dir/herdr-commander"
     link_safe "../../.agents/skills/herdr-commander" "$claude_dir/herdr-commander"
+    link_safe "$agents_dir/herdr-commander" "$codex_dir/herdr-commander"
+    link_safe "$agents_dir/herdr-commander" "$agy_dir/herdr-commander"
 
 # Check lint and formatting.
 lint:

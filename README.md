@@ -10,7 +10,7 @@ Run from a clean `main` checkout:
 just sync
 ```
 
-This installs `herdr-spaces-status` and `hss` via `uv tool install --reinstall .` and symlinks `skill/herdr-commander` into `~/.agents/skills/herdr-commander` and `~/.claude/skills/herdr-commander`.
+This installs `herdr-spaces-status` and `hss` via `uv tool install --reinstall .` and symlinks `skill/herdr-commander` into `~/.agents/skills/herdr-commander`, `~/.claude/skills/herdr-commander` (Claude), `${CODEX_HOME:-~/.codex}/skills/herdr-commander` (Codex), and `~/.gemini/config/skills/herdr-commander` (Antigravity / `agy`).
 
 ## Commands
 
