@@ -891,6 +891,10 @@ class AiAgentClientTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "DEPENDENCY_MISSING")
         self.assertEqual(ctx.exception.exit_code, EXIT_CONFIG)
 
+    def test_cli_ensure_defaults_to_ai_agent(self) -> None:
+        ns = build_parser().parse_args(["ensure", "--ticket", "CBRD-10009"])
+        self.assertEqual(ns.launcher, "ai-agent")
+
     def test_cli_ensure_ai_agent_dry_run_uses_preflight(self) -> None:
         ns = build_parser().parse_args(
             ["ensure", "--ticket", "CBRD-10009", "--launcher", "ai-agent", "--dry-run", "--json"]

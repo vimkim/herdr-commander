@@ -221,11 +221,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_ensure.add_argument("--base", help="Base ref for `cubrid-worktree create --base`")
     p_ensure.add_argument(
         "--launcher",
-        default="ay",
+        default="ai-agent",
         choices=tuple(LAUNCHERS.keys()),
         help=(
-            "First-tab launcher (default: ay). `ai-agent` picks `ay` (agy) or "
-            "`ai-round` (claude) by remaining quota"
+            "First-tab launcher (default: ai-agent, which picks `ay` (agy) or "
+            "`ai-round` (claude) by remaining quota)"
         ),
     )
     p_ensure.add_argument(

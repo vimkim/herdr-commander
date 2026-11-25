@@ -54,7 +54,7 @@ Map each task to its target directory and launcher before calling `ensure`.
 
 Launcher meanings:
 
-- `ai-agent` picks `ay` (Herdr agent `agy`) or `ai-round` (Herdr agent `claude`) by remaining quota at launch time. It never selects Codex. `ensure` runs `ai-agent --dry-run --json` first, so `--dry-run` reports the predicted agent kind and an exhausted quota fails before any worktree is created.
+- `ai-agent` is the `ensure` default. It picks `ay` (Herdr agent `agy`) or `ai-round` (Herdr agent `claude`) by remaining quota at launch time. It never selects Codex. `ensure` runs `ai-agent --dry-run --json` first, so `--dry-run` reports the predicted agent kind and an exhausted quota fails before any worktree is created.
 - `ay` forces Antigravity CLI. `ai-round` forces Claude round-robin across numbered slots. `ai-best` forces the strongest Claude setup.
 
 Do not choose `codex` or `claude` unless the user asks for it.

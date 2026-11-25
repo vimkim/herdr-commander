@@ -55,8 +55,8 @@ hss ensure --cwd ~/gh/my-repo --label my-repo --launcher ai-agent --json
 
 | Launcher | Herdr agent kind | Notes |
 | --- | --- | --- |
-| `ai-agent` (recommended) | `agy` or `claude` | Picks `ay` or `ai-round` by remaining quota and never selects Codex. |
-| `ay` (default) | `agy` | Antigravity CLI. |
+| `ai-agent` (default) | `agy` or `claude` | Picks `ay` or `ai-round` by remaining quota and never selects Codex. |
+| `ay` | `agy` | Antigravity CLI. |
 | `ai-round` | `claude` | Claude round-robin across numbered slots. |
 | `ai-best` | `claude` | Strongest Claude setup. |
 | `codex`, `claude` | `codex`, `claude` | Direct `herdr agent start` in bypass mode. Use only on explicit request. |
