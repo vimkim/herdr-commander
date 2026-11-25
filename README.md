@@ -106,4 +106,7 @@ Failures leave stdout empty and write one structured JSON line to stderr:
 
 ```bash
 just check
+just --choose
 ```
+
+Parameterless `hss` CLI lifecycle and query presets live in `hss.just` (`just --list hss` / `just hss <recipe>`).

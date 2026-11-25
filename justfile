@@ -1,6 +1,8 @@
+mod hss
+
 # Show available recipes.
 default:
-    @just --list
+    @just --list --list-submodules
 
 alias install := sync
 
@@ -8,9 +10,7 @@ alias install := sync
 sync:
     @test -d .git || { echo "Run just sync from the primary checkout, not a task worktree." >&2; exit 1; }
     @test "$(git branch --show-current)" = main || { echo "Run just sync from main." >&2; exit 1; }
-    uv tool install --reinstall .
-    herdr-spaces-status --help >/dev/null
-    hss --help >/dev/null
+    just hss::install
     just install-skill
 
 # Symlink skill/herdr-commander for shared agents, Claude, Codex, and Antigravity (agy).
