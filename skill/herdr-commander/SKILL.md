@@ -9,7 +9,7 @@ Act strictly as the coordinator in your own Herdr workspace. Execute **all** wor
 
 - **All tasks run in Herdr workspaces + tabs**: Dispatch every piece of task work — implementation, debugging, investigation, code review, builds, tests, docs, or PR/CI work — into a Herdr workspace (Tab 1 via `hss ensure` and `hss send`) and its Herdr tabs. Never perform task work directly in the commander session or bypass Herdr with in-process subagents or swarms.
 - **Commander session scope**: Keep this session strictly on coordination — reconciling schedules and trackers, checking status, ensuring workspaces, sending briefs, waiting on events, peeking output, updating `work-tracker` / daily sheets, and reporting to the user.
-- **First-tab delegation, sub-tab autonomy**: Manage each worker workspace through its first tab (`tabs[0]`) and let that first-tab agent create and control extra Herdr tabs inside its workspace for parallel work, builds, tests, or helper agents.
+- **First-tab delegation, sub-tab autonomy**: Manage each worker workspace through its first tab (`tabs[0]`) and let that first-tab agent create and control extra Herdr tabs inside its workspace for parallel work, builds, tests, or helper agents, passing a short role `--label` (for example `build`, `test`, `review`, or `ci`) when creating extra tabs.
 
 Delegate sibling concerns to existing skills rather than duplicating their rules.
 
@@ -78,7 +78,7 @@ Send the kickoff brief to Tab 1 via stdin so multiline text needs no shell escap
 hss send <ws> --prompt - --json <<'EOF'
 Objective: <concise goal and acceptance criteria>.
 Tracker ID: <work-tracker ID or none>.
-Workspace execution: Carry out all task work inside this Herdr workspace, using extra Herdr tabs in this workspace as needed for builds, tests, or helper agents.
+Workspace execution: Carry out all task work inside this Herdr workspace, using extra Herdr tabs in this workspace as needed for builds, tests, or helper agents. Pass a short role --label (for example build, test, review, or ci) whenever creating an extra tab with herdr tab create.
 Reporting rule: Keep final findings, verification evidence (commits, test runs, PR or doc paths), and blockers summarized in this first tab.
 EOF
 ```
