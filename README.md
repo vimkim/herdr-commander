@@ -46,13 +46,23 @@ hss wait --until blocked,done --timeout 300 --verify-busy --json
 
 ### `ensure`
 
-Idempotently converge a workspace and its first-tab agent (`ay`, `ai-round`, `ai-best`, `codex`, `claude`, `shell`):
+Idempotently converge a workspace and its first-tab agent:
 
 ```bash
-hss ensure --ticket CBRD-10002 --launcher ay --dry-run --json
-hss ensure --cwd ~/gh/my-repo --label my-repo --launcher ai-round --json
+hss ensure --ticket CBRD-10002 --launcher ai-agent --dry-run --json
+hss ensure --cwd ~/gh/my-repo --label my-repo --launcher ai-agent --json
 ```
 
+| Launcher | Herdr agent kind | Notes |
+| --- | --- | --- |
+| `ai-agent` (recommended) | `agy` or `claude` | Picks `ay` or `ai-round` by remaining quota and never selects Codex. |
+| `ay` (default) | `agy` | Antigravity CLI. |
+| `ai-round` | `claude` | Claude round-robin across numbered slots. |
+| `ai-best` | `claude` | Strongest Claude setup. |
+| `codex`, `claude` | `codex`, `claude` | Direct `herdr agent start` in bypass mode. Use only on explicit request. |
+| `shell` | none | Workspace only, no agent. |
+
+- `ai-agent` runs `ai-agent --dry-run --json` before creating a workspace. `--dry-run` reports the predicted agent kind, and a quota failure such as `AI_AGENT_NO_ELIGIBLE_BACKEND` stops before any worktree is created. Either `agy` or `claude` in the first tab counts as a match for reuse and readiness.
 - Reuses matching open workspaces and matching running first-tab agents.
 - Delegates `--ticket` and `--pr` workspace creation to `cubrid-worktree` and `--cwd` creation to `herdr-next-to-current` or `herdr workspace create --no-focus`.
 - Refuses to overwrite a first-tab pane already occupied by a different agent kind (`OCCUPIED_BY_OTHER_AGENT`).

@@ -23,6 +23,7 @@ from .herdr_client import (
     HerdrSocketClient,
     agent_prompt,
     agent_start,
+    ai_agent_select_backend,
     create_workspace_cubrid_pr,
     create_workspace_cubrid_ticket,
     create_workspace_cwd,
@@ -72,7 +73,7 @@ Examples:
   hss status --plain --fields number,workspace_id,attention,label
   hss peek w1 --lines 40
   hss wait --until blocked,done --timeout 300 --verify-busy --json
-  hss ensure --ticket CBRD-10002 --launcher ay --json
+  hss ensure --ticket CBRD-10002 --launcher ai-agent --json
   hss send w1 --prompt "Summarize findings in tab 1." --json
 """
 
@@ -222,7 +223,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--launcher",
         default="ay",
         choices=tuple(LAUNCHERS.keys()),
-        help="First-tab launcher (default: ay)",
+        help=(
+            "First-tab launcher (default: ay). `ai-agent` picks `ay` (agy) or "
+            "`ai-round` (claude) by remaining quota"
+        ),
     )
     p_ensure.add_argument(
         "--ready-timeout",
@@ -504,6 +508,7 @@ def _dispatch(
             run_pane=pane_run,
             start_agent=agent_start,
             env=env,
+            select_backend=ai_agent_select_backend,
             self_workspace_id=self_workspace_id,
             dry_run=bool(ns.dry_run),
             ready_timeout=float(ns.ready_timeout),

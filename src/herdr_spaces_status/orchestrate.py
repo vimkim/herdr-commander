@@ -88,6 +88,12 @@ class StartAgentFn(Protocol):
     ) -> dict[str, Any]: ...
 
 
+class SelectBackendFn(Protocol):
+    """Callback matching `herdr_client.ai_agent_select_backend`."""
+
+    def __call__(self) -> str: ...
+
+
 class PromptAgentFn(Protocol):
     """Callback matching `herdr_client.agent_prompt`."""
 
@@ -103,53 +109,85 @@ class PromptAgentFn(Protocol):
 
 @dataclass(frozen=True)
 class LauncherSpec:
-    """Definition of a supported first-tab agent or shell launcher."""
+    """Definition of a supported first-tab agent or shell launcher.
+
+    `expected_agents` lists every Herdr agent kind the launcher may start; an
+    empty tuple means a plain shell. `selects_backend` marks launchers such as
+    `ai-agent` that choose their backend at launch time and support a
+    `--dry-run --json` preflight.
+    """
 
     name: str
-    expected_agent: str | None
+    expected_agents: tuple[str, ...]
     mode: str  # "pane_run" | "agent_start" | "none"
     command: str | None = None
     agent_kind: str | None = None
     forward_claude_env: bool = False
+    forward_env: tuple[str, ...] = ()
+    selects_backend: bool = False
+
+    @property
+    def launches_agent(self) -> bool:
+        return bool(self.expected_agents)
+
+    def accepts(self, agent_kind: str | None) -> bool:
+        return agent_kind is not None and agent_kind in self.expected_agents
+
+    @property
+    def expected_label(self) -> str:
+        return " or ".join(repr(kind) for kind in self.expected_agents)
+
+
+# Backend names reported by `ai-agent --dry-run --json` mapped to Herdr agent kinds.
+AI_AGENT_BACKEND_AGENTS: dict[str, str] = {"ay": "agy", "ai-round": "claude"}
 
 
 LAUNCHERS: dict[str, LauncherSpec] = {
     "ai-round": LauncherSpec(
         name="ai-round",
-        expected_agent="claude",
+        expected_agents=("claude",),
         mode="pane_run",
         command="ai-round",
         forward_claude_env=True,
     ),
     "ai-best": LauncherSpec(
         name="ai-best",
-        expected_agent="claude",
+        expected_agents=("claude",),
         mode="pane_run",
         command="ai-best",
         forward_claude_env=True,
     ),
+    "ai-agent": LauncherSpec(
+        name="ai-agent",
+        expected_agents=("agy", "claude"),
+        mode="pane_run",
+        command="ai-agent",
+        forward_claude_env=True,
+        forward_env=("AI_AGENT_BACKEND", "AI_AGENT_PREFER", "AI_AGENT_MIN_REMAINING"),
+        selects_backend=True,
+    ),
     "ay": LauncherSpec(
         name="ay",
-        expected_agent="agy",
+        expected_agents=("agy",),
         mode="pane_run",
         command="ay",
         forward_claude_env=False,
     ),
     "codex": LauncherSpec(
         name="codex",
-        expected_agent="codex",
+        expected_agents=("codex",),
         mode="agent_start",
         agent_kind="codex",
     ),
     "claude": LauncherSpec(
         name="claude",
-        expected_agent="claude",
+        expected_agents=("claude",),
         mode="agent_start",
         agent_kind="claude",
     ),
     "shell": LauncherSpec(
         name="shell",
-        expected_agent=None,
+        expected_agents=(),
         mode="none",
     ),
 }
@@ -179,15 +217,16 @@ def build_pane_run_command(launcher: LauncherSpec, env: Mapping[str, str]) -> st
     """Build the shell command line sent to `herdr pane run`."""
     if not launcher.command:
         raise ValueError(f"Launcher {launcher.name!r} has no pane_run command")
-    if not launcher.forward_claude_env:
-        return launcher.command
-
     assignments: list[str] = []
-    for var in _CLAUDE_ENV_VARS:
+    if launcher.forward_claude_env:
+        for var in _CLAUDE_ENV_VARS:
+            value = env.get(var, "").strip()
+            if value:
+                value = str(Path(value).expanduser().resolve())
+                assignments.append(f"{var}={shlex.quote(value)}")
+    for var in launcher.forward_env:
         value = env.get(var, "").strip()
         if value:
-            if var in {"CLAUDE_ACCOUNTS_DIR", "CLAUDE_CONFIG_DIR", "XDG_STATE_HOME"}:
-                value = str(Path(value).expanduser().resolve())
             assignments.append(f"{var}={shlex.quote(value)}")
     if not assignments:
         return launcher.command
@@ -239,6 +278,23 @@ def _find_matching_space(
                 if pane_cwd == norm_cwd:
                     return space
     return None
+
+
+def _single_agent(spec: LauncherSpec) -> str | None:
+    return spec.expected_agents[0] if len(spec.expected_agents) == 1 else None
+
+
+def resolve_backend_agent(backend: str) -> str:
+    """Map an `ai-agent` backend name to the Herdr agent kind it launches."""
+    agent = AI_AGENT_BACKEND_AGENTS.get(backend)
+    if agent is None:
+        raise CliError(
+            "AI_AGENT_UNKNOWN_BACKEND",
+            f"ai-agent selected unsupported backend {backend!r}.",
+            f"Expected one of: {', '.join(AI_AGENT_BACKEND_AGENTS)}. Update hss or ai-agent.",
+            details={"backend": backend},
+        )
+    return agent
 
 
 def plan_ensure(
@@ -311,7 +367,7 @@ def plan_ensure(
     if existing is not None:
         pane = existing.primary_pane
         existing_pane_id = pane.pane_id if pane else None
-        if spec.expected_agent is None:
+        if not spec.launches_agent:
             agent_action = "none"
         elif pane is None:
             raise CliError(
@@ -319,7 +375,7 @@ def plan_ensure(
                 f"Workspace {existing.workspace_id} ({existing.label}) has no primary pane.",
                 "Inspect the workspace tabs in Herdr before retrying.",
             )
-        elif pane.agent_kind == spec.expected_agent:
+        elif spec.accepts(pane.agent_kind):
             agent_action = "reuse"
         elif pane.agent_kind is None:
             agent_action = "launch"
@@ -328,21 +384,24 @@ def plan_ensure(
                 "OCCUPIED_BY_OTHER_AGENT",
                 (
                     f"Primary pane {pane.pane_id} in {existing.label} already runs "
-                    f"{pane.agent_kind!r}, not {spec.expected_agent!r}."
+                    f"{pane.agent_kind!r}, not {spec.expected_label}."
                 ),
                 "Reuse the existing agent, or open a sibling tab manually if intentional.",
                 details={
                     "workspace_id": existing.workspace_id,
                     "pane_id": pane.pane_id,
                     "running_agent": pane.agent_kind,
-                    "expected_agent": spec.expected_agent,
+                    "expected_agent": _single_agent(spec),
+                    "expected_agents": list(spec.expected_agents),
                 },
             )
         return EnsurePlan(
             workspace_action="reuse",
             agent_action=agent_action,
             launcher=spec.name,
-            expected_agent=spec.expected_agent,
+            expected_agent=(
+                pane.agent_kind if agent_action == "reuse" and pane else _single_agent(spec)
+            ),
             label=existing.label,
             cwd=pane.cwd if pane and pane.cwd else norm_cwd,
             ticket=norm_ticket or existing.ticket_key,
@@ -366,9 +425,9 @@ def plan_ensure(
 
     return EnsurePlan(
         workspace_action=workspace_action,
-        agent_action="none" if spec.expected_agent is None else "launch",
+        agent_action="launch" if spec.launches_agent else "none",
         launcher=spec.name,
-        expected_agent=spec.expected_agent,
+        expected_agent=_single_agent(spec),
         label=derived_label,
         cwd=norm_cwd,
         ticket=norm_ticket,
@@ -390,13 +449,24 @@ def execute_ensure(
     run_pane: RunPaneFn,
     start_agent: StartAgentFn,
     env: Mapping[str, str],
+    select_backend: SelectBackendFn | None = None,
     self_workspace_id: str | None = None,
     dry_run: bool = False,
     ready_timeout: float = 45.0,
     poll_interval: float = 0.5,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> EnsureResult:
-    """Execute an EnsurePlan idempotently, converging workspace and first-tab agent."""
+    """Execute an EnsurePlan idempotently, converging workspace and first-tab agent.
+
+    For backend-selecting launchers (`ai-agent`), `select_backend` runs a read-only
+    preflight before any workspace is created so quota failures surface fast and
+    dry runs report the predicted agent kind.
+    """
+    spec = LAUNCHERS[plan.launcher]
+    predicted_agent = plan.expected_agent
+    if spec.selects_backend and plan.agent_action == "launch" and select_backend is not None:
+        predicted_agent = resolve_backend_agent(select_backend())
+
     if dry_run:
         return EnsureResult(
             dry_run=True,
@@ -408,7 +478,7 @@ def execute_ensure(
             tab_id=None,
             pane_id=plan.existing_pane_id,
             cwd=plan.cwd,
-            agent_kind=plan.expected_agent,
+            agent_kind=predicted_agent,
             agent_status=None,
             agent_name=plan.agent_name,
         )
@@ -435,11 +505,10 @@ def execute_ensure(
         )
 
     pane = target_space.primary_pane
-    spec = LAUNCHERS[plan.launcher]
-    if spec.expected_agent is None:
+    if not spec.launches_agent:
         return _build_ensure_result(plan, target_space, agent_action="none")
 
-    if pane.agent_kind == spec.expected_agent:
+    if spec.accepts(pane.agent_kind):
         return _build_ensure_result(plan, target_space, agent_action="reuse")
 
     if pane.agent_kind is not None:
@@ -447,7 +516,7 @@ def execute_ensure(
             "OCCUPIED_BY_OTHER_AGENT",
             (
                 f"Primary pane {pane.pane_id} already runs {pane.agent_kind!r}, "
-                f"expected {spec.expected_agent!r}."
+                f"expected {spec.expected_label}."
             ),
             "Inspect the pane before launching another agent.",
             details={"workspace_id": target_space.workspace_id, "pane_id": pane.pane_id},
@@ -478,7 +547,7 @@ def execute_ensure(
     settled = _wait_for_launched_agent(
         client=client,
         workspace_id=target_space.workspace_id,
-        expected_agent=spec.expected_agent,
+        expected_agents=spec.expected_agents,
         self_workspace_id=self_workspace_id,
         timeout=ready_timeout,
         poll_interval=poll_interval,
@@ -513,13 +582,14 @@ def _wait_for_launched_agent(
     *,
     client: SnapshotClient,
     workspace_id: str,
-    expected_agent: str,
+    expected_agents: tuple[str, ...],
     self_workspace_id: str | None,
     timeout: float,
     poll_interval: float,
     sleep_fn: Callable[[float], None],
 ) -> SpaceSnapshot:
     deadline = time.monotonic() + timeout
+    expected_label = " or ".join(expected_agents)
     last_space: SpaceSnapshot | None = None
     while True:
         spaces = parse_snapshot(client.snapshot(), self_workspace_id=self_workspace_id)
@@ -527,11 +597,14 @@ def _wait_for_launched_agent(
         if space is not None and space.primary_pane is not None:
             last_space = space
             pane = space.primary_pane
-            if pane.agent_kind == expected_agent:
+            if pane.agent_kind in expected_agents:
                 if pane.raw_status == "blocked":
                     raise CliError(
                         "AGENT_STARTUP_BLOCKED",
-                        f"Launched agent {expected_agent} is blocked at startup in {pane.pane_id}.",
+                        (
+                            f"Launched agent {pane.agent_kind} is blocked at startup "
+                            f"in {pane.pane_id}."
+                        ),
                         f"Inspect it with `herdr-spaces-status peek {workspace_id}`.",
                         details={"workspace_id": workspace_id, "pane_id": pane.pane_id},
                     )
@@ -541,7 +614,7 @@ def _wait_for_launched_agent(
             raise CliError(
                 "AGENT_READY_TIMEOUT",
                 (
-                    f"Timed out after {timeout:.0f}s waiting for {expected_agent} "
+                    f"Timed out after {timeout:.0f}s waiting for {expected_label} "
                     f"in workspace {workspace_id}."
                 ),
                 f"Inspect the pane with `herdr-spaces-status peek {workspace_id}` before retrying.",

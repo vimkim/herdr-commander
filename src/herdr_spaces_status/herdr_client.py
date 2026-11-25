@@ -489,6 +489,57 @@ def _parse_cubrid_worktree_result(raw: str) -> dict[str, Any]:
         ) from exc
 
 
+def ai_agent_select_backend(*, timeout: float = 30.0) -> str:
+    """Return the backend (`ay` or `ai-round`) `ai-agent` would launch, without launching."""
+    args = ["ai-agent", "--dry-run", "--json"]
+    fix = "Run `ai-agent --dry-run` to inspect backend quota, or pass --launcher ay / ai-round."
+    try:
+        proc = subprocess.run(
+            args,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise CliError(
+            "DEPENDENCY_MISSING",
+            "Required executable 'ai-agent' was not found on PATH.",
+            "Install ai-agent on PATH, or pass --launcher ay / ai-round.",
+            exit_code=EXIT_CONFIG,
+        ) from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CliError("AI_AGENT_FAILED", f"Failed to run ai-agent: {exc}", fix) from exc
+
+    if proc.returncode != 0:
+        error: dict[str, Any] = {}
+        try:
+            parsed = json.loads(proc.stderr.strip().splitlines()[-1])
+            if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+                error = parsed["error"]
+        except (ValueError, IndexError):
+            pass
+        message = error.get("message") or proc.stderr.strip() or f"exit code {proc.returncode}"
+        code = error.get("code")
+        raise CliError(
+            f"AI_AGENT_{code}" if isinstance(code, str) else "AI_AGENT_FAILED",
+            f"ai-agent cannot select a backend: {message}",
+            str(error.get("fix") or fix),
+            exit_code=EXIT_CONFIG if proc.returncode == EXIT_CONFIG else EXIT_DOMAIN,
+        )
+
+    try:
+        backend = json.loads(proc.stdout)["data"]["selected"]["name"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise CliError(
+            "AI_AGENT_FAILED", "Could not parse `ai-agent --dry-run --json` output.", fix
+        ) from exc
+    if not isinstance(backend, str):
+        raise CliError("AI_AGENT_FAILED", "ai-agent reported no selected backend.", fix)
+    return backend
+
+
 def pane_run(pane_id: str, command: str, *, timeout: float = 15.0) -> None:
     """Run a shell command inside an available Herdr pane."""
     _run_subprocess(

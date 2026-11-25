@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 from herdr_spaces_status.cli import _dispatch, build_parser
 from herdr_spaces_status.formatters import OutputMode
-from herdr_spaces_status.models import CliError
+from herdr_spaces_status.herdr_client import ai_agent_select_backend
+from herdr_spaces_status.models import EXIT_CONFIG, CliError
 from herdr_spaces_status.orchestrate import (
     LAUNCHERS,
     build_agent_start_args,
@@ -18,6 +19,7 @@ from herdr_spaces_status.orchestrate import (
     execute_ensure,
     execute_send,
     plan_ensure,
+    resolve_backend_agent,
     sanitize_agent_name,
     validate_send,
 )
@@ -635,6 +637,272 @@ class CliWiringRegressionTests(unittest.TestCase):
         data_wait = json.loads(out_wait)["data"]
         self.assertTrue(data_wait["waited"])
         self.assertEqual(data_wait["settled_status"], "done")
+
+
+def _noop_ensure_callbacks(
+    created: list[str] | None = None,
+    ran: list[tuple[str, str]] | None = None,
+) -> dict[str, object]:
+    created_log = created if created is not None else []
+    ran_log = ran if ran is not None else []
+
+    def create_ticket(ticket: str, *, base: str | None = None) -> dict[str, object]:
+        created_log.append(ticket)
+        return {}
+
+    return {
+        "create_cwd": lambda _l, _c: {},
+        "create_ticket": create_ticket,
+        "create_pr": lambda _p: {},
+        "run_pane": lambda pid, cmd: ran_log.append((pid, cmd)),
+        "start_agent": lambda _n, _k, _p, _a, *, timeout_ms=45000: {},
+    }
+
+
+class AiAgentLauncherTests(unittest.TestCase):
+    def _spaces(self, raw: dict | None = None) -> list:
+        return parse_snapshot(raw or load_fixture(), path_exists=lambda _p: True)
+
+    def test_spec_accepts_agy_and_claude_but_never_codex(self) -> None:
+        spec = LAUNCHERS["ai-agent"]
+        self.assertTrue(spec.launches_agent)
+        self.assertTrue(spec.accepts("agy"))
+        self.assertTrue(spec.accepts("claude"))
+        self.assertFalse(spec.accepts("codex"))
+        self.assertFalse(spec.accepts(None))
+        self.assertEqual(resolve_backend_agent("ay"), "agy")
+        self.assertEqual(resolve_backend_agent("ai-round"), "claude")
+        with self.assertRaises(CliError) as ctx:
+            resolve_backend_agent("codex")
+        self.assertEqual(ctx.exception.code, "AI_AGENT_UNKNOWN_BACKEND")
+
+    def test_pane_run_command_forwards_claude_and_ai_agent_env(self) -> None:
+        cmd = build_pane_run_command(
+            LAUNCHERS["ai-agent"],
+            {
+                "CLAUDE_CONFIG_DIR": "/tmp/claude cfg",
+                "AI_AGENT_PREFER": "ai-round",
+                "AI_AGENT_MIN_REMAINING": "30",
+                "AI_AGENT_BACKEND": "",
+            },
+        )
+        self.assertIn("CLAUDE_CONFIG_DIR='/tmp/claude cfg'", cmd)
+        self.assertIn("AI_AGENT_PREFER=ai-round", cmd)
+        self.assertIn("AI_AGENT_MIN_REMAINING=30", cmd)
+        self.assertNotIn("AI_AGENT_BACKEND", cmd)
+        self.assertTrue(cmd.endswith(" ai-agent"))
+        self.assertEqual(build_pane_run_command(LAUNCHERS["ai-agent"], {}), "ai-agent")
+
+    def test_plan_reuses_agy_or_claude_and_launches_into_shell(self) -> None:
+        spaces = self._spaces()
+        common = {"label": None, "cwd": None, "pr_number": None, "launcher_name": "ai-agent"}
+
+        agy = plan_ensure(spaces, ticket="CBRD-10001", **common)
+        self.assertEqual((agy.agent_action, agy.expected_agent), ("reuse", "agy"))
+
+        claude = plan_ensure(spaces, ticket="CBRD-10003", **common)
+        self.assertEqual((claude.agent_action, claude.expected_agent), ("reuse", "claude"))
+
+        shell = plan_ensure(spaces, ticket="CBRD-10002", **common)
+        self.assertEqual((shell.agent_action, shell.expected_agent), ("launch", None))
+
+        new = plan_ensure(spaces, ticket="CBRD-10009", **common)
+        self.assertEqual(new.workspace_action, "create_cubrid_ticket")
+        self.assertEqual(new.agent_action, "launch")
+
+    def test_plan_refuses_codex_occupied_pane(self) -> None:
+        raw = _append_workspace(
+            load_fixture(),
+            workspace_id="w9",
+            label="codex-space",
+            number=9,
+            tab_id="w9:t1",
+            pane_id="w9:p1",
+            cwd="/tmp/codex-space",
+            agent_kind="codex",
+            agent_status="idle",
+        )
+        with self.assertRaises(CliError) as ctx:
+            plan_ensure(
+                self._spaces(raw),
+                label="codex-space",
+                cwd=None,
+                ticket=None,
+                pr_number=None,
+                launcher_name="ai-agent",
+            )
+        self.assertEqual(ctx.exception.code, "OCCUPIED_BY_OTHER_AGENT")
+        assert ctx.exception.details is not None
+        self.assertEqual(ctx.exception.details["expected_agents"], ["agy", "claude"])
+
+    def test_dry_run_reports_predicted_agent_without_side_effects(self) -> None:
+        plan = plan_ensure(
+            self._spaces(),
+            label=None,
+            cwd=None,
+            ticket="CBRD-10009",
+            pr_number=None,
+            launcher_name="ai-agent",
+        )
+        created: list[str] = []
+        ran: list[tuple[str, str]] = []
+        result = execute_ensure(
+            plan,
+            client=FakeClient([load_fixture()]),
+            env={},
+            select_backend=lambda: "ai-round",
+            dry_run=True,
+            **_noop_ensure_callbacks(created, ran),
+        )
+        self.assertTrue(result.dry_run)
+        self.assertEqual(result.launcher, "ai-agent")
+        self.assertEqual(result.agent_kind, "claude")
+        self.assertEqual((created, ran), ([], []))
+
+    def test_preflight_failure_aborts_before_workspace_creation(self) -> None:
+        plan = plan_ensure(
+            self._spaces(),
+            label=None,
+            cwd=None,
+            ticket="CBRD-10009",
+            pr_number=None,
+            launcher_name="ai-agent",
+        )
+
+        def failing_select() -> str:
+            raise CliError("AI_AGENT_NO_ELIGIBLE_BACKEND", "no quota", "wait")
+
+        created: list[str] = []
+        with self.assertRaises(CliError) as ctx:
+            execute_ensure(
+                plan,
+                client=FakeClient([load_fixture()]),
+                env={},
+                select_backend=failing_select,
+                **_noop_ensure_callbacks(created),
+            )
+        self.assertEqual(ctx.exception.code, "AI_AGENT_NO_ELIGIBLE_BACKEND")
+        self.assertEqual(created, [])
+
+    def test_reuse_skips_preflight(self) -> None:
+        plan = plan_ensure(
+            self._spaces(),
+            label=None,
+            cwd=None,
+            ticket="CBRD-10003",
+            pr_number=None,
+            launcher_name="ai-agent",
+        )
+
+        def unexpected_select() -> str:
+            raise AssertionError("preflight must not run when reusing an agent")
+
+        result = execute_ensure(
+            plan,
+            client=FakeClient([load_fixture()]),
+            env={},
+            select_backend=unexpected_select,
+            **_noop_ensure_callbacks(),
+        )
+        self.assertEqual((result.agent_action, result.agent_kind), ("reuse", "claude"))
+
+    def test_launch_accepts_whichever_agent_ai_agent_started(self) -> None:
+        snap0 = load_fixture()
+        snap1 = copy.deepcopy(snap0)
+        for p in snap1["panes"]:
+            if p["pane_id"] == "w5:p1":
+                p["agent"] = "claude"
+                p["agent_status"] = "idle"
+        snap1["agents"].append(
+            {
+                "agent": "claude",
+                "agent_status": "idle",
+                "cwd": "/home/user/gh/cb/CBRD-10002",
+                "interactive_ready": True,
+                "name": "cbrd-10002",
+                "pane_id": "w5:p1",
+                "revision": 505,
+                "tab_id": "w5:t1",
+                "workspace_id": "w5",
+            }
+        )
+        plan = plan_ensure(
+            self._spaces(snap0),
+            label=None,
+            cwd=None,
+            ticket="CBRD-10002",
+            pr_number=None,
+            launcher_name="ai-agent",
+        )
+        ran: list[tuple[str, str]] = []
+        # Even if the preflight predicted agy, a claude pane started by ai-agent is accepted.
+        result = execute_ensure(
+            plan,
+            client=FakeClient([snap0, snap1]),
+            env={"AI_AGENT_PREFER": "ay"},
+            select_backend=lambda: "ay",
+            ready_timeout=5.0,
+            poll_interval=0.0,
+            sleep_fn=lambda _s: None,
+            **_noop_ensure_callbacks(ran=ran),
+        )
+        self.assertEqual(ran, [("w5:p1", "AI_AGENT_PREFER=ay ai-agent")])
+        self.assertEqual(result.agent_action, "launch")
+        self.assertEqual(result.agent_kind, "claude")
+
+
+class _FakeProc:
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class AiAgentClientTests(unittest.TestCase):
+    _TARGET = "herdr_spaces_status.herdr_client.subprocess.run"
+
+    def test_select_backend_parses_dry_run_json(self) -> None:
+        payload = {"ok": True, "schema_version": 1, "data": {"selected": {"name": "ay"}}}
+        with patch(self._TARGET, return_value=_FakeProc(0, json.dumps(payload))) as run:
+            self.assertEqual(ai_agent_select_backend(), "ay")
+        self.assertEqual(run.call_args.args[0], ["ai-agent", "--dry-run", "--json"])
+
+    def test_select_backend_surfaces_structured_error(self) -> None:
+        err = {
+            "ok": False,
+            "error": {
+                "code": "NO_ELIGIBLE_BACKEND",
+                "message": "No backend qualifies at the 20% minimum remaining threshold.",
+                "fix": "Force a backend.",
+                "transient": False,
+            },
+        }
+        with patch(self._TARGET, return_value=_FakeProc(1, stderr=json.dumps(err) + "\n")):
+            with self.assertRaises(CliError) as ctx:
+                ai_agent_select_backend()
+        self.assertEqual(ctx.exception.code, "AI_AGENT_NO_ELIGIBLE_BACKEND")
+        self.assertEqual(ctx.exception.fix, "Force a backend.")
+        self.assertIn("20% minimum", ctx.exception.message)
+
+    def test_select_backend_missing_executable_is_config_error(self) -> None:
+        with patch(self._TARGET, side_effect=FileNotFoundError("ai-agent")):
+            with self.assertRaises(CliError) as ctx:
+                ai_agent_select_backend()
+        self.assertEqual(ctx.exception.code, "DEPENDENCY_MISSING")
+        self.assertEqual(ctx.exception.exit_code, EXIT_CONFIG)
+
+    def test_cli_ensure_ai_agent_dry_run_uses_preflight(self) -> None:
+        ns = build_parser().parse_args(
+            ["ensure", "--ticket", "CBRD-10009", "--launcher", "ai-agent", "--dry-run", "--json"]
+        )
+        payload = {"ok": True, "schema_version": 1, "data": {"selected": {"name": "ai-round"}}}
+        mode = OutputMode(fmt="json", color=False, is_tty_stdout=False, is_tty_stderr=False)
+        with patch(self._TARGET, return_value=_FakeProc(0, json.dumps(payload))):
+            raw_out = _dispatch(ns, FakeClient([load_fixture()]), {}, "w4", mode)
+        data = json.loads(raw_out)["data"]
+        self.assertEqual(data["launcher"], "ai-agent")
+        self.assertEqual(data["agent_action"], "launch")
+        self.assertEqual(data["agent_kind"], "claude")
 
 
 if __name__ == "__main__":

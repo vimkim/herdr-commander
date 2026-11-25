@@ -1,6 +1,6 @@
 ---
 name: herdr-commander
-description: Coordinate all tasks through Herdr workspaces and Herdr tabs by managing each workspace's first-tab agent. Use when acting as a Herdr commander to plan or dispatch work into Herdr workspaces, launch ai-round, ai-best, ay, or codex in matching worktrees or directories, monitor first-tab progress, or harvest completed workspace results.
+description: Coordinate all tasks through Herdr workspaces and Herdr tabs by managing each workspace's first-tab agent. Use when acting as a Herdr commander to plan or dispatch work into Herdr workspaces, launch ai-agent, ay, ai-round, or ai-best in matching worktrees or directories, monitor first-tab progress, or harvest completed workspace results.
 ---
 
 # Herdr Commander
@@ -47,20 +47,27 @@ Map each task to its target directory and launcher before calling `ensure`.
 
 | Task type | Target flag | Default launcher |
 | --- | --- | --- |
-| CUBRID ticket implementation or debug | `--ticket CBRD-NNNNN` | `ay` or `ai-best` |
-| CUBRID PR review checkout | `--pr NNNN` | `codex` or `ay` |
-| Parallel medium work, tests, or docs | `--cwd /path/to/repo` | `ai-round` |
-| Independent code review | `--cwd /path/to/repo` | `codex` |
+| CUBRID ticket implementation or debug | `--ticket CBRD-NNNNN` | `ai-agent` (or `ai-best` for hard tasks) |
+| CUBRID PR review checkout | `--pr NNNN` | `ai-agent` |
+| Parallel medium work, tests, or docs | `--cwd /path/to/repo` | `ai-agent` |
+| Independent code review | `--cwd /path/to/repo` | `ai-agent` |
 
-Before starting multiple Claude sessions (`ai-round` or `ai-best`), check remaining account quota with `ai-status`. Switch to `ay` or `codex` when Claude slots are low.
+Launcher meanings:
+
+- `ai-agent` picks `ay` (Herdr agent `agy`) or `ai-round` (Herdr agent `claude`) by remaining quota at launch time. It never selects Codex. `ensure` runs `ai-agent --dry-run --json` first, so `--dry-run` reports the predicted agent kind and an exhausted quota fails before any worktree is created.
+- `ay` forces Antigravity CLI. `ai-round` forces Claude round-robin across numbered slots. `ai-best` forces the strongest Claude setup.
+
+Do not choose `codex` or `claude` unless the user asks for it.
+
+Before dispatching several workspaces at once, check quota with `ai-agent --dry-run`. If it reports `NO_ELIGIBLE_BACKEND`, pause dispatch and tell the user instead of falling back to Codex.
 
 ## 3. Ensure workspaces and brief Tab 1
 
 Run `ensure` for each assigned task. It reuses matching open workspaces, creates CUBRID worktrees via `cubrid-worktree` or general directories via `herdr-next-to-current`, and waits until the first-tab agent is ready.
 
 ```bash
-hss ensure --ticket CBRD-10002 --launcher ay --json
-hss ensure --cwd ~/gh/my-project --label my-project --launcher ai-round --json
+hss ensure --ticket CBRD-10002 --launcher ai-agent --json
+hss ensure --cwd ~/gh/my-project --label my-project --launcher ai-agent --json
 ```
 
 If `ensure` exits with `OCCUPIED_BY_OTHER_AGENT`, inspect the workspace with `hss peek <ws>` instead of overwriting the pane.
