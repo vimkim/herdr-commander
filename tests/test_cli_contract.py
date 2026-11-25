@@ -246,6 +246,38 @@ class CliContractTests(unittest.TestCase):
                 self.assertTrue(data["dry_run"])
                 self.assertEqual(data["prompt_chars"], len("Line 1\nLine 2\n"))
 
+    def test_tab_and_pane_list_via_socket(self) -> None:
+        snapshot = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = Path(tmpdir) / "herdr.sock"
+            with MockHerdrServer(sock_path, snapshot):
+                tab_proc = run_cli(
+                    ["--socket", str(sock_path), "tab", "list", "--json"],
+                    env={
+                        "HERDR_WORKSPACE_ID": "w1",
+                        "HERDR_TAB_ID": "w1:t1",
+                        "HERDR_PANE_ID": "w1:p1",
+                    },
+                )
+                self.assertEqual(tab_proc.returncode, 0, tab_proc.stderr)
+                tab_data = json.loads(tab_proc.stdout)["data"]
+                self.assertEqual(tab_data["caller"]["role"], "space_leader")
+                self.assertEqual(tab_data["sub_tab_count"], 2)
+
+                pane_proc = run_cli(
+                    ["--socket", str(sock_path), "pane", "list", "--json"],
+                    env={
+                        "HERDR_WORKSPACE_ID": "w2",
+                        "HERDR_TAB_ID": "w2:t4",
+                        "HERDR_PANE_ID": "w2:p4",
+                        "HERDR_TAB_ROLE": "worker",
+                    },
+                )
+                self.assertEqual(pane_proc.returncode, 0, pane_proc.stderr)
+                pane_data = json.loads(pane_proc.stdout)["data"]
+                self.assertEqual(pane_data["caller"]["role"], "tab_leader")
+                self.assertEqual(pane_data["worker_pane_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

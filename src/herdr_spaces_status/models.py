@@ -27,6 +27,13 @@ VALID_SORT_MODES = ("attention", "number")
 VALID_WAIT_STATES = frozenset(ATTENTION_ORDER.keys()) | {"busy_bg"}
 DEFAULT_WAIT_STATES = ("blocked", "done")
 
+DEFAULT_MAX_SUB_TABS = 8
+DEFAULT_MAX_WORKER_PANES = 3
+DEFAULT_MAX_SPACE_AGENTS = 4
+DEFAULT_MAX_SESSION_AGENTS = 10
+
+VALID_SPLIT_DIRECTIONS = ("auto", "right", "down")
+
 
 class CliError(Exception):
     """Structured error raised across domain boundaries and formatted by cli.py."""
@@ -241,6 +248,239 @@ class SendResult:
     waited: bool
     settled_status: str | None
     prompt_chars: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CallerContext:
+    """Resolved Herdr hierarchy role of the calling pane."""
+
+    workspace_id: str
+    tab_id: str
+    pane_id: str
+    tab_index: int
+    pane_index: int
+    role: str  # "space_leader" | "tab_leader" | "leaf_worker"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PaneInfo:
+    """Detailed state of one pane inside a workspace tab."""
+
+    pane_id: str
+    tab_id: str
+    workspace_id: str
+    index: int
+    is_primary: bool
+    is_self: bool
+    cwd: str
+    foreground_cwd: str
+    cwd_exists: bool
+    agent_kind: str | None
+    agent_name: str | None
+    raw_status: str
+    effective_status: str
+    interactive_ready: bool
+    session_id: str | None
+    revision: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class WorkspaceTabInfo:
+    """Detailed state of one tab and its panes inside a workspace."""
+
+    tab_id: str
+    workspace_id: str
+    label: str
+    base_label: str
+    index: int
+    number: int
+    is_primary: bool
+    is_self: bool
+    pane_count: int
+    agent_status: str
+    primary_pane: PaneInfo | None
+    panes: tuple[PaneInfo, ...]
+
+    def to_dict(self, *, include_panes: bool = True) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "tab_id": self.tab_id,
+            "workspace_id": self.workspace_id,
+            "label": self.label,
+            "base_label": self.base_label,
+            "index": self.index,
+            "number": self.number,
+            "is_primary": self.is_primary,
+            "is_self": self.is_self,
+            "pane_count": self.pane_count,
+            "agent_status": self.agent_status,
+            "primary_pane": self.primary_pane.to_dict() if self.primary_pane else None,
+        }
+        if include_panes:
+            data["panes"] = [pane.to_dict() for pane in self.panes]
+        return data
+
+
+@dataclass(frozen=True)
+class TabSpawnPlan:
+    """Validated plan for creating a worker sub-tab inside the caller's Space."""
+
+    workspace_id: str
+    label: str
+    cwd: str
+    launcher: str
+    expected_agent: str | None
+    agent_name: str | None
+    prompt: str | None
+    current_sub_tabs: int
+    max_sub_tabs: int
+    space_agents: int
+    max_space_agents: int
+    session_working_agents: int
+    max_session_agents: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TabSpawnResult:
+    """Result of planning or creating a sub-tab and optional worker agent."""
+
+    dry_run: bool
+    workspace_id: str
+    tab_id: str | None
+    pane_id: str | None
+    label: str
+    cwd: str
+    launcher: str
+    agent_kind: str | None
+    agent_status: str | None
+    agent_name: str | None
+    prompt_sent: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TabWaitResult:
+    """Result of waiting for sub-tabs in the caller's Space to enter target states."""
+
+    workspace_id: str
+    until: tuple[str, ...]
+    matched: tuple[WorkspaceTabInfo, ...]
+    elapsed_seconds: float
+    from_initial_snapshot: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "workspace_id": self.workspace_id,
+            "until": list(self.until),
+            "matched": [tab.to_dict(include_panes=False) for tab in self.matched],
+            "elapsed_seconds": round(self.elapsed_seconds, 3),
+            "from_initial_snapshot": self.from_initial_snapshot,
+        }
+
+
+@dataclass(frozen=True)
+class TabCloseResult:
+    """Result of closing a non-primary sub-tab in the caller's Space."""
+
+    dry_run: bool
+    workspace_id: str
+    tab_id: str
+    label: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PaneSpawnPlan:
+    """Validated plan for splitting a worker pane inside the caller's tab."""
+
+    workspace_id: str
+    tab_id: str
+    split_target_pane_id: str
+    direction: str
+    cwd: str
+    launcher: str
+    expected_agent: str | None
+    agent_name: str | None
+    shell_cmd: str | None
+    prompt: str | None
+    current_worker_panes: int
+    max_worker_panes: int
+    space_agents: int
+    max_space_agents: int
+    session_working_agents: int
+    max_session_agents: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PaneSpawnResult:
+    """Result of planning or splitting a worker pane in the caller's tab."""
+
+    dry_run: bool
+    workspace_id: str
+    tab_id: str
+    pane_id: str | None
+    split_target_pane_id: str
+    direction: str
+    cwd: str
+    launcher: str
+    agent_kind: str | None
+    agent_status: str | None
+    agent_name: str | None
+    shell_cmd: str | None
+    prompt_sent: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PaneWaitResult:
+    """Result of waiting for worker panes in the caller's tab to enter target states."""
+
+    workspace_id: str
+    tab_id: str
+    until: tuple[str, ...]
+    matched: tuple[PaneInfo, ...]
+    elapsed_seconds: float
+    from_initial_snapshot: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "workspace_id": self.workspace_id,
+            "tab_id": self.tab_id,
+            "until": list(self.until),
+            "matched": [pane.to_dict() for pane in self.matched],
+            "elapsed_seconds": round(self.elapsed_seconds, 3),
+            "from_initial_snapshot": self.from_initial_snapshot,
+        }
+
+
+@dataclass(frozen=True)
+class PaneCloseResult:
+    """Result of closing a non-primary worker pane in the caller's tab."""
+
+    dry_run: bool
+    workspace_id: str
+    tab_id: str
+    pane_id: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

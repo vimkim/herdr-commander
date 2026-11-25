@@ -11,12 +11,21 @@ from typing import Any
 from .models import (
     EXIT_USAGE,
     SCHEMA_VERSION,
+    CallerContext,
     CliError,
     EnsureResult,
+    PaneCloseResult,
+    PaneInfo,
+    PaneSpawnResult,
+    PaneWaitResult,
     PeekResult,
     SendResult,
     SpaceSnapshot,
+    TabCloseResult,
+    TabSpawnResult,
+    TabWaitResult,
     WaitResult,
+    WorkspaceTabInfo,
 )
 
 STATUS_FIELDS: tuple[str, ...] = (
@@ -395,3 +404,223 @@ def format_send(result: SendResult, mode: OutputMode) -> str:
         f"{result.label} ({result.workspace_id}, {result.pane_id}, {result.agent_kind})"
         f"{status_info}"
     )
+
+
+def format_tab_list(
+    caller: CallerContext,
+    tabs: Sequence[WorkspaceTabInfo],
+    mode: OutputMode,
+) -> str:
+    """Render `tab list` output."""
+    if mode.fmt == "json":
+        return format_json_success(
+            {
+                "workspace_id": caller.workspace_id,
+                "caller": caller.to_dict(),
+                "count": len(tabs),
+                "sub_tab_count": max(0, len(tabs) - 1),
+                "tabs": [tab.to_dict(include_panes=True) for tab in tabs],
+            }
+        )
+    if mode.fmt == "plain":
+        rows = []
+        for tab in tabs:
+            pane = tab.primary_pane
+            rows.append(
+                "\t".join(
+                    (
+                        str(tab.index + 1),
+                        tab.tab_id,
+                        "lead" if tab.is_primary else "worker",
+                        tab.agent_status,
+                        pane.agent_kind or "shell" if pane else "-",
+                        pane.pane_id if pane else "-",
+                        str(len(tab.panes)),
+                        tab.base_label,
+                    )
+                )
+            )
+        return "\n".join(rows)
+
+    lines = [
+        f"Workspace {caller.workspace_id} | caller={caller.pane_id} ({caller.role})",
+        f"{'#':>2}  {'TAB':<7}  {'ROLE':<6}  {'STATUS':<8}  {'AGENT':<8}  {'PANES':>5}  LABEL",
+    ]
+    for tab in tabs:
+        pane = tab.primary_pane
+        role = "lead" if tab.is_primary else "worker"
+        agent = pane.agent_kind or "shell" if pane else "-"
+        if pane and pane.effective_status == "busy_bg":
+            agent = f"{agent}(bg)"
+        status_str = _colorize(f"{tab.agent_status:<8}", tab.agent_status, mode)
+        self_mark = "*" if tab.is_self else ""
+        lines.append(
+            f"{tab.index + 1:>2}  {tab.tab_id:<7}  {role:<6}  {status_str}  "
+            f"{agent:<8}  {len(tab.panes):>5}  {tab.base_label}{self_mark}"
+        )
+    return "\n".join(lines)
+
+
+def format_tab_spawn(result: TabSpawnResult, mode: OutputMode) -> str:
+    """Render `tab spawn` output."""
+    if mode.fmt == "json":
+        return format_json_success(result.to_dict())
+    if mode.fmt == "plain":
+        return "\t".join(
+            (
+                "dry-run" if result.dry_run else "spawned",
+                result.workspace_id,
+                result.tab_id or "-",
+                result.pane_id or "-",
+                result.launcher,
+                result.agent_kind or "shell",
+                result.label,
+            )
+        )
+    prefix = "[dry-run] " if result.dry_run else ""
+    tab_desc = f"{result.tab_id or 'new'}, pane={result.pane_id or 'new'}"
+    return (
+        f"{prefix}Sub-tab {result.label} ({tab_desc}): "
+        f"launcher={result.launcher}, agent={result.agent_kind or 'shell'}"
+        f"{' (prompted)' if result.prompt_sent else ''}"
+    )
+
+
+def format_tab_wait(result: TabWaitResult, mode: OutputMode) -> str:
+    """Render `tab wait` output."""
+    if mode.fmt == "json":
+        return format_json_success(result.to_dict())
+    if mode.fmt == "plain":
+        return "\n".join(
+            "\t".join(
+                (
+                    tab.tab_id,
+                    tab.agent_status,
+                    tab.primary_pane.pane_id if tab.primary_pane else "-",
+                    tab.base_label,
+                )
+            )
+            for tab in result.matched
+        )
+    lines = [
+        f"Matched {len(result.matched)} tab(s) in {result.workspace_id} for "
+        f"[{', '.join(result.until)}] in {result.elapsed_seconds:.2f}s:"
+    ]
+    for tab in result.matched:
+        pid = tab.primary_pane.pane_id if tab.primary_pane else "-"
+        lines.append(f"  {tab.tab_id}  {tab.agent_status:<8}  {pid}  {tab.base_label}")
+    return "\n".join(lines)
+
+
+def format_tab_close(result: TabCloseResult, mode: OutputMode) -> str:
+    """Render `tab close` output."""
+    if mode.fmt == "json":
+        return format_json_success(result.to_dict())
+    if mode.fmt == "plain":
+        return "\t".join(("dry-run" if result.dry_run else "closed", result.tab_id, result.label))
+    prefix = "[dry-run] " if result.dry_run else ""
+    return f"{prefix}Closed sub-tab {result.tab_id} ({result.label})"
+
+
+def format_pane_list(
+    caller: CallerContext,
+    tab: WorkspaceTabInfo,
+    panes: Sequence[PaneInfo],
+    mode: OutputMode,
+) -> str:
+    """Render `pane list` output."""
+    if mode.fmt == "json":
+        return format_json_success(
+            {
+                "workspace_id": caller.workspace_id,
+                "tab_id": tab.tab_id,
+                "tab_label": tab.base_label,
+                "caller": caller.to_dict(),
+                "count": len(panes),
+                "worker_pane_count": max(0, len(panes) - 1),
+                "panes": [pane.to_dict() for pane in panes],
+            }
+        )
+    if mode.fmt == "plain":
+        return "\n".join(
+            "\t".join(
+                (
+                    str(pane.index + 1),
+                    pane.pane_id,
+                    "lead" if pane.is_primary else "worker",
+                    pane.effective_status,
+                    pane.agent_kind or "shell",
+                    pane.agent_name or "-",
+                    pane.cwd or "-",
+                )
+            )
+            for pane in panes
+        )
+    lines = [
+        f"Tab {tab.tab_id} ({tab.base_label}) | caller={caller.pane_id} ({caller.role})",
+        f"{'#':>2}  {'PANE':<8}  {'ROLE':<6}  {'STATUS':<8}  {'AGENT':<8}  {'NAME':<16}  CWD",
+    ]
+    for pane in panes:
+        role = "lead" if pane.is_primary else "worker"
+        agent = pane.agent_kind or "shell"
+        if pane.effective_status == "busy_bg":
+            agent = f"{agent}(bg)"
+        status_str = _colorize(f"{pane.effective_status:<8}", pane.effective_status, mode)
+        self_mark = "*" if pane.is_self else ""
+        lines.append(
+            f"{pane.index + 1:>2}  {pane.pane_id:<8}  {role:<6}  {status_str}  "
+            f"{agent:<8}  {(pane.agent_name or '-') + self_mark:<16}  {_shorten_path(pane.cwd)}"
+        )
+    return "\n".join(lines)
+
+
+def format_pane_spawn(result: PaneSpawnResult, mode: OutputMode) -> str:
+    """Render `pane spawn` output."""
+    if mode.fmt == "json":
+        return format_json_success(result.to_dict())
+    if mode.fmt == "plain":
+        return "\t".join(
+            (
+                "dry-run" if result.dry_run else "spawned",
+                result.tab_id,
+                result.pane_id or "-",
+                result.direction,
+                result.launcher,
+                result.agent_kind or "shell",
+            )
+        )
+    prefix = "[dry-run] " if result.dry_run else ""
+    return (
+        f"{prefix}Worker pane {result.pane_id or 'new'} in {result.tab_id} "
+        f"({result.direction} from {result.split_target_pane_id}): "
+        f"launcher={result.launcher}, agent={result.agent_kind or 'shell'}"
+        f"{' (prompted)' if result.prompt_sent else ''}"
+    )
+
+
+def format_pane_wait(result: PaneWaitResult, mode: OutputMode) -> str:
+    """Render `pane wait` output."""
+    if mode.fmt == "json":
+        return format_json_success(result.to_dict())
+    if mode.fmt == "plain":
+        return "\n".join(
+            "\t".join((pane.pane_id, pane.effective_status, pane.agent_kind or "shell"))
+            for pane in result.matched
+        )
+    lines = [
+        f"Matched {len(result.matched)} pane(s) in {result.tab_id} for "
+        f"[{', '.join(result.until)}] in {result.elapsed_seconds:.2f}s:"
+    ]
+    for pane in result.matched:
+        lines.append(f"  {pane.pane_id}  {pane.effective_status:<8}  {pane.agent_kind or 'shell'}")
+    return "\n".join(lines)
+
+
+def format_pane_close(result: PaneCloseResult, mode: OutputMode) -> str:
+    """Render `pane close` output."""
+    if mode.fmt == "json":
+        return format_json_success(result.to_dict())
+    if mode.fmt == "plain":
+        return "\t".join(("dry-run" if result.dry_run else "closed", result.tab_id, result.pane_id))
+    prefix = "[dry-run] " if result.dry_run else ""
+    return f"{prefix}Closed worker pane {result.pane_id} in {result.tab_id}"

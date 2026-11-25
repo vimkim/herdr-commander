@@ -4,21 +4,27 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from .models import (
     ATTENTION_ORDER,
+    EXIT_CONFIG,
+    CallerContext,
     CliError,
+    PaneInfo,
     PrimaryPane,
     SpaceSnapshot,
     SubTabRollup,
     TabSummary,
+    WorkspaceTabInfo,
 )
 
 TICKET_PATTERN = re.compile(r"\b(CBRD-\d+)\b", re.IGNORECASE)
+_DECORATED_PREFIX = re.compile(r"^\d+\s+[▶!✓○?—]\s+")
+_DECORATED_SUFFIX = re.compile(r"\s+\[t\d+\]$")
 
 # Ported from herdr-attention's detection-buffer classifier for Claude Code.
 _RULE = re.compile(r"^\s*─{3,}\s*$")
@@ -68,12 +74,12 @@ def _compute_attention(primary_pane: PrimaryPane | None, deleted_hint: bool) -> 
     return "unknown"
 
 
-def _build_primary_pane(
+def _extract_pane_fields(
     pane: dict[str, Any],
     agent: dict[str, Any] | None,
     *,
     path_exists: Callable[[str], bool],
-) -> PrimaryPane:
+) -> dict[str, Any]:
     merged = {**pane, **(agent or {})}
     cwd = str(merged.get("cwd") or "")
     foreground_cwd = str(merged.get("foreground_cwd") or cwd)
@@ -94,18 +100,48 @@ def _build_primary_pane(
         if isinstance(val, str) and val:
             session_id = val
 
-    return PrimaryPane(
-        pane_id=str(pane["pane_id"]),
-        cwd=cwd,
-        foreground_cwd=foreground_cwd,
-        cwd_exists=cwd_exists,
-        agent_kind=agent_kind,
-        agent_name=agent_name,
-        raw_status=raw_status,
-        effective_status=effective_status,
-        interactive_ready=bool(merged.get("interactive_ready", False)),
-        session_id=session_id,
-        revision=int(merged.get("revision") or 0),
+    return {
+        "pane_id": str(pane["pane_id"]),
+        "cwd": cwd,
+        "foreground_cwd": foreground_cwd,
+        "cwd_exists": cwd_exists,
+        "agent_kind": agent_kind,
+        "agent_name": agent_name,
+        "raw_status": raw_status,
+        "effective_status": effective_status,
+        "interactive_ready": bool(merged.get("interactive_ready", False)),
+        "session_id": session_id,
+        "revision": int(merged.get("revision") or 0),
+    }
+
+
+def _build_primary_pane(
+    pane: dict[str, Any],
+    agent: dict[str, Any] | None,
+    *,
+    path_exists: Callable[[str], bool],
+) -> PrimaryPane:
+    return PrimaryPane(**_extract_pane_fields(pane, agent, path_exists=path_exists))
+
+
+def _build_pane_info(
+    pane: dict[str, Any],
+    agent: dict[str, Any] | None,
+    *,
+    tab_id: str,
+    workspace_id: str,
+    index: int,
+    self_pane_id: str | None,
+    path_exists: Callable[[str], bool],
+) -> PaneInfo:
+    fields = _extract_pane_fields(pane, agent, path_exists=path_exists)
+    return PaneInfo(
+        tab_id=tab_id,
+        workspace_id=workspace_id,
+        index=index,
+        is_primary=(index == 0),
+        is_self=(self_pane_id is not None and fields["pane_id"] == self_pane_id),
+        **fields,
     )
 
 
@@ -474,3 +510,337 @@ def collect_live_agent_names(raw: dict[str, Any]) -> set[str]:
         if isinstance(name, str) and name:
             names.add(name)
     return names
+
+
+def strip_tab_decorations(label: str) -> str:
+    """Strip herdr-tab-status position/marker prefix and `[tN]` suffix from a tab label."""
+    cleaned = _DECORATED_SUFFIX.sub("", label)
+    cleaned = _DECORATED_PREFIX.sub("", cleaned)
+    return cleaned.strip() or label
+
+
+def _index_snapshot_entities(
+    raw: dict[str, Any],
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, list[dict[str, Any]]],
+    dict[str, dict[str, Any]],
+    dict[str, list[str]],
+]:
+    tabs = raw.get("tabs")
+    panes = raw.get("panes")
+    agents = raw.get("agents")
+    layouts = raw.get("layouts")
+    if not all(isinstance(x, list) for x in (tabs, panes, agents)):
+        raise ValueError("Herdr snapshot is missing tab, pane, or agent lists")
+    layouts_list = layouts if isinstance(layouts, list) else []
+
+    panes_by_id: dict[str, dict[str, Any]] = {}
+    panes_by_tab: dict[str, list[dict[str, Any]]] = {}
+    for pane in panes:
+        pid = pane.get("pane_id")
+        tid = pane.get("tab_id")
+        if isinstance(pid, str) and pid:
+            panes_by_id[pid] = pane
+        if isinstance(tid, str) and tid:
+            panes_by_tab.setdefault(tid, []).append(pane)
+
+    agents_by_pane: dict[str, dict[str, Any]] = {}
+    for agent in agents:
+        pid = agent.get("pane_id")
+        if isinstance(pid, str) and pid:
+            agents_by_pane[pid] = agent
+
+    layout_pane_order: dict[str, list[str]] = {}
+    for layout in layouts_list:
+        tid = layout.get("tab_id")
+        layout_panes = layout.get("panes")
+        if isinstance(tid, str) and isinstance(layout_panes, list):
+            ordered_ids: list[str] = []
+            for entry in layout_panes:
+                if isinstance(entry, str):
+                    ordered_ids.append(entry)
+                elif isinstance(entry, dict) and isinstance(entry.get("pane_id"), str):
+                    ordered_ids.append(entry["pane_id"])
+            if ordered_ids:
+                layout_pane_order[tid] = ordered_ids
+
+    return panes_by_id, panes_by_tab, agents_by_pane, layout_pane_order
+
+
+def _ordered_tab_panes(
+    tab_id: str,
+    panes_by_id: dict[str, dict[str, Any]],
+    panes_by_tab: dict[str, list[dict[str, Any]]],
+    layout_pane_order: dict[str, list[str]],
+) -> list[dict[str, Any]]:
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for pid in layout_pane_order.get(tab_id, ()):
+        candidate = panes_by_id.get(pid)
+        if candidate is not None and candidate.get("tab_id") == tab_id and pid not in seen:
+            ordered.append(candidate)
+            seen.add(pid)
+    for pane in panes_by_tab.get(tab_id, []):
+        pid = str(pane.get("pane_id") or "")
+        if pid and pid not in seen:
+            ordered.append(pane)
+            seen.add(pid)
+    return ordered
+
+
+def parse_workspace_tabs(
+    raw: dict[str, Any],
+    workspace_id: str,
+    *,
+    self_tab_id: str | None = None,
+    self_pane_id: str | None = None,
+    path_exists: Callable[[str], bool] = os.path.exists,
+) -> list[WorkspaceTabInfo]:
+    """Parse ordered tabs and panes belonging to a single Herdr workspace."""
+    panes_by_id, panes_by_tab, agents_by_pane, layout_pane_order = _index_snapshot_entities(raw)
+    ws_tabs = [tab for tab in raw.get("tabs", []) if tab.get("workspace_id") == workspace_id]
+
+    result: list[WorkspaceTabInfo] = []
+    for tab_idx, tab in enumerate(ws_tabs):
+        tid = str(tab["tab_id"])
+        label = str(tab.get("label") or "")
+        raw_panes = _ordered_tab_panes(tid, panes_by_id, panes_by_tab, layout_pane_order)
+        pane_infos = tuple(
+            _build_pane_info(
+                pane,
+                agents_by_pane.get(str(pane["pane_id"])),
+                tab_id=tid,
+                workspace_id=workspace_id,
+                index=pane_idx,
+                self_pane_id=self_pane_id,
+                path_exists=path_exists,
+            )
+            for pane_idx, pane in enumerate(raw_panes)
+        )
+        primary_pane = pane_infos[0] if pane_infos else None
+        fallback_status = (
+            "shell" if primary_pane is not None else _normalize_status(tab.get("agent_status"))
+        )
+        agent_status = (
+            primary_pane.effective_status
+            if primary_pane and primary_pane.agent_kind is not None
+            else fallback_status
+        )
+        result.append(
+            WorkspaceTabInfo(
+                tab_id=tid,
+                workspace_id=workspace_id,
+                label=label,
+                base_label=strip_tab_decorations(label),
+                index=tab_idx,
+                number=int(tab.get("number") or (tab_idx + 1)),
+                is_primary=(tab_idx == 0),
+                is_self=(self_tab_id is not None and tid == self_tab_id),
+                pane_count=int(tab.get("pane_count") or len(pane_infos)),
+                agent_status=agent_status,
+                primary_pane=primary_pane,
+                panes=pane_infos,
+            )
+        )
+    return result
+
+
+def resolve_caller_context(
+    raw: dict[str, Any],
+    env: Mapping[str, str],
+    *,
+    path_exists: Callable[[str], bool] = os.path.exists,
+) -> CallerContext:
+    """Resolve the calling pane's hierarchy role from Herdr env vars and live snapshot."""
+    workspace_id = env.get("HERDR_WORKSPACE_ID", "").strip()
+    tab_id = env.get("HERDR_TAB_ID", "").strip()
+    pane_id = env.get("HERDR_PANE_ID", "").strip()
+    if not (workspace_id and tab_id and pane_id):
+        raise CliError(
+            "MISSING_CALLER_CONTEXT",
+            "HERDR_WORKSPACE_ID, HERDR_TAB_ID, and HERDR_PANE_ID are required.",
+            "Run this command from inside a Herdr-managed pane.",
+            exit_code=EXIT_CONFIG,
+        )
+
+    tabs = parse_workspace_tabs(
+        raw,
+        workspace_id,
+        self_tab_id=tab_id,
+        self_pane_id=pane_id,
+        path_exists=path_exists,
+    )
+    tab = next((t for t in tabs if t.tab_id == tab_id), None)
+    if tab is None:
+        raise CliError(
+            "CALLER_NOT_IN_SNAPSHOT",
+            f"Calling tab {tab_id} in workspace {workspace_id} was not found in Herdr snapshot.",
+            "Verify HERDR_WORKSPACE_ID and HERDR_TAB_ID match the active Herdr session.",
+            exit_code=EXIT_CONFIG,
+        )
+    pane = next((p for p in tab.panes if p.pane_id == pane_id), None)
+    if pane is None:
+        raise CliError(
+            "CALLER_NOT_IN_SNAPSHOT",
+            f"Calling pane {pane_id} in tab {tab_id} was not found in Herdr snapshot.",
+            "Verify HERDR_PANE_ID matches the active Herdr session.",
+            exit_code=EXIT_CONFIG,
+        )
+
+    tab_role_env = env.get("HERDR_TAB_ROLE", "").strip().lower()
+    pane_role_env = env.get("HERDR_PANE_ROLE", "").strip().lower()
+    if pane_role_env == "worker" or pane.index > 0:
+        role = "leaf_worker"
+    elif tab_role_env == "worker" or tab.index > 0:
+        role = "tab_leader"
+    else:
+        role = "space_leader"
+
+    return CallerContext(
+        workspace_id=workspace_id,
+        tab_id=tab_id,
+        pane_id=pane_id,
+        tab_index=tab.index,
+        pane_index=pane.index,
+        role=role,
+    )
+
+
+def count_workspace_non_primary_agents(tabs: Sequence[WorkspaceTabInfo]) -> int:
+    """Count live AI agent panes in a workspace excluding the primary Space Leader pane."""
+    count = 0
+    for tab in tabs:
+        for pane in tab.panes:
+            if tab.is_primary and pane.is_primary:
+                continue
+            if pane.agent_kind is not None:
+                count += 1
+    return count
+
+
+def count_session_working_agents(raw: dict[str, Any]) -> int:
+    """Count AI agent panes across the entire Herdr session currently in working state."""
+    agents_by_pane: dict[str, dict[str, Any]] = {}
+    for agent in raw.get("agents", []):
+        pid = agent.get("pane_id")
+        if isinstance(pid, str) and pid:
+            agents_by_pane[pid] = agent
+    working = 0
+    for pane in raw.get("panes", []):
+        pid = pane.get("pane_id")
+        if (
+            isinstance(pid, str)
+            and _pane_effective_status(pane, agents_by_pane.get(pid)) == "working"
+        ):
+            working += 1
+    return working
+
+
+def verify_panes_claude_busy(
+    panes: Sequence[PaneInfo],
+    read_detection: Callable[[str], str],
+) -> list[PaneInfo]:
+    """Promote idle/done Claude panes with active background tasks to busy_bg."""
+    updated: list[PaneInfo] = []
+    for pane in panes:
+        if pane.agent_kind == "claude" and pane.raw_status in {"idle", "done"}:
+            try:
+                verdict = classify_claude_detection(read_detection(pane.pane_id))
+            except (CliError, ValueError, KeyError, TypeError):
+                verdict = "unverified"
+            if verdict == "claude_busy":
+                updated.append(replace(pane, effective_status="busy_bg"))
+                continue
+        updated.append(pane)
+    return updated
+
+
+def resolve_tab_target(tabs: Sequence[WorkspaceTabInfo], selector: str) -> WorkspaceTabInfo:
+    """Resolve a tab inside one workspace by tab_id, short ID, pane_id, label, or base_label."""
+    if not selector:
+        raise CliError(
+            "INVALID_TARGET",
+            "Tab selector cannot be empty.",
+            "Pass a tab ID (e.g. w1:t2 or t2) or tab label.",
+        )
+
+    for match_fn, err_label in (
+        (lambda t: t.tab_id == selector, "tab ID"),
+        (
+            lambda t: (
+                selector.startswith("t")
+                and selector[1:].isdigit()
+                and t.tab_id.endswith(f":{selector}")
+            ),
+            "short tab ID",
+        ),
+        (lambda t: any(p.pane_id == selector for p in t.panes), "pane ID"),
+        (lambda t: t.label == selector or t.base_label == selector, "label"),
+        (
+            lambda t: (
+                t.label.lower() == selector.lower() or t.base_label.lower() == selector.lower()
+            ),
+            "label",
+        ),
+    ):
+        matches = [t for t in tabs if match_fn(t)]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise CliError(
+                "TAB_AMBIGUOUS",
+                f"Multiple tabs match {err_label} {selector!r}.",
+                "Pass an exact tab ID instead.",
+                details={"candidates": [t.tab_id for t in matches]},
+            )
+
+    raise CliError(
+        "TAB_NOT_FOUND",
+        f"No tab found matching {selector!r}.",
+        "Run `hss tab list` to inspect tabs in this workspace.",
+    )
+
+
+def resolve_pane_target(panes: Sequence[PaneInfo], selector: str) -> PaneInfo:
+    """Resolve a pane inside one tab by pane_id, short ID, 1-based position, or agent name."""
+    if not selector:
+        raise CliError(
+            "INVALID_TARGET",
+            "Pane selector cannot be empty.",
+            "Pass a pane ID (e.g. w1:p2 or p2), 1-based pane index, or agent name.",
+        )
+
+    lowered = selector.lower()
+    for match_fn, err_label in (
+        (lambda p: p.pane_id == selector, "pane ID"),
+        (
+            lambda p: (
+                selector.startswith("p")
+                and selector[1:].isdigit()
+                and p.pane_id.endswith(f":{selector}")
+            ),
+            "short pane ID",
+        ),
+        (
+            lambda p: selector.isdigit() and (p.index + 1) == int(selector),
+            "pane position",
+        ),
+        (lambda p: (p.agent_name or "").lower() == lowered and bool(p.agent_name), "agent name"),
+    ):
+        matches = [p for p in panes if match_fn(p)]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise CliError(
+                "PANE_AMBIGUOUS",
+                f"Multiple panes match {err_label} {selector!r}.",
+                "Pass an exact pane ID instead.",
+                details={"candidates": [p.pane_id for p in matches]},
+            )
+
+    raise CliError(
+        "PANE_NOT_FOUND",
+        f"No pane found matching {selector!r}.",
+        "Run `hss pane list` to inspect panes in this tab.",
+    )

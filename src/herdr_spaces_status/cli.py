@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from . import __version__
 from .formatters import (
@@ -12,9 +13,17 @@ from .formatters import (
     OutputMode,
     format_ensure,
     format_error,
+    format_pane_close,
+    format_pane_list,
+    format_pane_spawn,
+    format_pane_wait,
     format_peek,
     format_send,
     format_status,
+    format_tab_close,
+    format_tab_list,
+    format_tab_spawn,
+    format_tab_wait,
     format_wait,
     parse_fields,
     resolve_output_mode,
@@ -28,35 +37,62 @@ from .herdr_client import (
     create_workspace_cubrid_ticket,
     create_workspace_cwd,
     fetch_work_tracker_items,
+    pane_close,
     pane_run,
+    pane_split,
     resolve_socket_path,
+    tab_close,
+    tab_create,
     workspace_env_overrides,
 )
 from .models import (
+    DEFAULT_MAX_SESSION_AGENTS,
+    DEFAULT_MAX_SPACE_AGENTS,
+    DEFAULT_MAX_SUB_TABS,
+    DEFAULT_MAX_WORKER_PANES,
     DEFAULT_WAIT_STATES,
     EXIT_DOMAIN,
     EXIT_OK,
     EXIT_SIGINT,
     EXIT_USAGE,
     VALID_SORT_MODES,
+    VALID_SPLIT_DIRECTIONS,
     VALID_WAIT_STATES,
     CliError,
+    PaneInfo,
     PeekResult,
 )
 from .orchestrate import (
     LAUNCHERS,
     execute_ensure,
+    execute_pane_close,
+    execute_pane_send,
+    execute_pane_spawn,
+    execute_pane_wait,
     execute_send,
+    execute_tab_close,
+    execute_tab_send,
+    execute_tab_spawn,
+    execute_tab_wait,
     execute_wait,
     plan_ensure,
+    plan_pane_spawn,
+    plan_tab_spawn,
+    verify_tabs_claude_busy,
 )
 from .snapshot import (
     collect_live_agent_names,
     correlate_work_tracker,
+    count_session_working_agents,
     filter_spaces,
     parse_snapshot,
+    parse_workspace_tabs,
+    resolve_caller_context,
+    resolve_pane_target,
+    resolve_tab_target,
     resolve_target,
     verify_claude_busy,
+    verify_panes_claude_busy,
 )
 
 _EPILOG = """
@@ -273,6 +309,318 @@ def build_parser() -> argparse.ArgumentParser:
         help="Validate target and readiness without sending input",
     )
 
+    p_tab = subparsers.add_parser(
+        "tab",
+        parents=[common],
+        help="Manage sub-tabs inside the caller's Space (Space Leader only)",
+    )
+    tab_sub = p_tab.add_subparsers(dest="tab_command", metavar="SUBCOMMAND")
+
+    p_tab_list = tab_sub.add_parser(
+        "list",
+        parents=[common],
+        help="List tabs inside the caller's Space",
+    )
+    p_tab_list.add_argument(
+        "--verify-busy",
+        action="store_true",
+        help="Inspect Claude detection buffer to flag background-busy panes as busy_bg",
+    )
+
+    p_tab_spawn = tab_sub.add_parser(
+        "spawn",
+        parents=[common],
+        help="Create a worker sub-tab inside the caller's Space (up to 8 sub-tabs)",
+    )
+    p_tab_spawn.add_argument(
+        "--label",
+        required=True,
+        help="Short role label for the sub-tab (e.g. build, test, review, ci)",
+    )
+    p_tab_spawn.add_argument("--cwd", help="Working directory (defaults to caller tab cwd)")
+    p_tab_spawn.add_argument(
+        "--launcher",
+        default="ai-agent",
+        choices=tuple(LAUNCHERS.keys()),
+        help="Worker launcher (default: ai-agent)",
+    )
+    p_tab_spawn.add_argument("--prompt", help="Optional kickoff prompt (or `-` for stdin)")
+    p_tab_spawn.add_argument(
+        "--ready-timeout",
+        type=float,
+        default=45.0,
+        help="Seconds to wait for launched agent readiness (default: 45)",
+    )
+    p_tab_spawn.add_argument(
+        "--max-sub-tabs",
+        type=int,
+        default=None,
+        help=(
+            f"Max non-primary sub-tabs in this Space (default: {DEFAULT_MAX_SUB_TABS}, 0=unlimited)"
+        ),
+    )
+    p_tab_spawn.add_argument(
+        "--max-space-agents",
+        type=int,
+        default=None,
+        help=(
+            "Max live non-primary AI agents in this Space "
+            f"(default: {DEFAULT_MAX_SPACE_AGENTS}, 0=unlimited)"
+        ),
+    )
+    p_tab_spawn.add_argument(
+        "--max-session-agents",
+        type=int,
+        default=None,
+        help=(
+            "Max working AI agents across the Herdr session "
+            f"(default: {DEFAULT_MAX_SESSION_AGENTS}, 0=unlimited)"
+        ),
+    )
+    p_tab_spawn.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate limits and preflight launcher without creating a tab",
+    )
+
+    p_tab_peek = tab_sub.add_parser(
+        "peek",
+        parents=[common],
+        help="Read recent output from a tab's primary pane in the caller's Space",
+    )
+    p_tab_peek.add_argument("target", help="Tab ID (w1:t2 or t2), pane ID, or role label")
+    p_tab_peek.add_argument("--lines", type=int, default=40, help="Lines to read (default: 40)")
+    p_tab_peek.add_argument(
+        "--source",
+        choices=("visible", "recent", "recent-unwrapped", "detection"),
+        default="recent-unwrapped",
+        help="Herdr read source (default: recent-unwrapped)",
+    )
+
+    p_tab_send = tab_sub.add_parser(
+        "send",
+        parents=[common],
+        help="Send a prompt to a sub-tab's primary agent in the caller's Space",
+    )
+    p_tab_send.add_argument("target", help="Tab ID (w1:t2 or t2), pane ID, or role label")
+    p_tab_send.add_argument(
+        "--prompt",
+        required=True,
+        help="Prompt text, or `-` to read from stdin",
+    )
+    p_tab_send.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait for agent completion via `herdr agent prompt --wait`",
+    )
+    p_tab_send.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Wait timeout in seconds when --wait is set (default: 120)",
+    )
+    p_tab_send.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow sending to self or busy agent",
+    )
+    p_tab_send.add_argument("--dry-run", action="store_true", help="Validate without sending input")
+
+    p_tab_wait = tab_sub.add_parser(
+        "wait",
+        parents=[common],
+        help="Wait for sub-tabs in the caller's Space to enter target states",
+    )
+    p_tab_wait.add_argument(
+        "--until",
+        default=",".join(DEFAULT_WAIT_STATES),
+        help="Comma-separated target states (default: blocked,done)",
+    )
+    p_tab_wait.add_argument("--target", help="Watch only one tab ID, pane ID, or role label")
+    p_tab_wait.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        help="Timeout in seconds (default: 300)",
+    )
+    p_tab_wait.add_argument(
+        "--verify-busy",
+        action="store_true",
+        help="Verify Claude background tasks",
+    )
+
+    p_tab_close = tab_sub.add_parser(
+        "close",
+        parents=[common],
+        help="Close a non-primary worker sub-tab in the caller's Space",
+    )
+    p_tab_close.add_argument("target", help="Sub-tab ID (w1:t2 or t2), pane ID, or role label")
+    p_tab_close.add_argument("--dry-run", action="store_true", help="Validate without closing tab")
+
+    p_pane = subparsers.add_parser(
+        "pane",
+        parents=[common],
+        help="Manage worker panes inside the caller's tab (Space/Tab Leader only)",
+    )
+    pane_sub = p_pane.add_subparsers(dest="pane_command", metavar="SUBCOMMAND")
+
+    p_pane_list = pane_sub.add_parser(
+        "list",
+        parents=[common],
+        help="List panes inside the caller's tab",
+    )
+    p_pane_list.add_argument(
+        "--verify-busy",
+        action="store_true",
+        help="Inspect Claude detection buffer to flag background-busy panes as busy_bg",
+    )
+
+    p_pane_spawn = pane_sub.add_parser(
+        "spawn",
+        parents=[common],
+        help="Split a worker pane inside the caller's tab (up to 3 worker panes / 2x2)",
+    )
+    p_pane_spawn.add_argument(
+        "--direction",
+        default="auto",
+        choices=VALID_SPLIT_DIRECTIONS,
+        help="Split direction (default: auto for 2x2 layout)",
+    )
+    p_pane_spawn.add_argument("--cwd", help="Working directory (defaults to caller pane cwd)")
+    p_pane_spawn.add_argument(
+        "--launcher",
+        default="ai-agent",
+        choices=tuple(LAUNCHERS.keys()),
+        help="Worker launcher (default: ai-agent)",
+    )
+    p_pane_spawn.add_argument(
+        "--cmd",
+        dest="shell_cmd",
+        help="Command to run with `--launcher shell`",
+    )
+    p_pane_spawn.add_argument("--prompt", help="Optional kickoff prompt (or `-` for stdin)")
+    p_pane_spawn.add_argument(
+        "--ready-timeout",
+        type=float,
+        default=45.0,
+        help="Seconds to wait for launched agent readiness (default: 45)",
+    )
+    p_pane_spawn.add_argument(
+        "--max-worker-panes",
+        type=int,
+        default=None,
+        help=(
+            "Max non-primary worker panes in this tab "
+            f"(default: {DEFAULT_MAX_WORKER_PANES}, 0=unlimited)"
+        ),
+    )
+    p_pane_spawn.add_argument(
+        "--max-space-agents",
+        type=int,
+        default=None,
+        help=(
+            "Max live non-primary AI agents in this Space "
+            f"(default: {DEFAULT_MAX_SPACE_AGENTS}, 0=unlimited)"
+        ),
+    )
+    p_pane_spawn.add_argument(
+        "--max-session-agents",
+        type=int,
+        default=None,
+        help=(
+            "Max working AI agents across the Herdr session "
+            f"(default: {DEFAULT_MAX_SESSION_AGENTS}, 0=unlimited)"
+        ),
+    )
+    p_pane_spawn.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate limits and preflight launcher without splitting a pane",
+    )
+
+    p_pane_peek = pane_sub.add_parser(
+        "peek",
+        parents=[common],
+        help="Read recent output from a pane inside the caller's tab",
+    )
+    p_pane_peek.add_argument("target", help="Pane ID (w1:p2 or p2), 1-based index, or agent name")
+    p_pane_peek.add_argument("--lines", type=int, default=40, help="Lines to read (default: 40)")
+    p_pane_peek.add_argument(
+        "--source",
+        choices=("visible", "recent", "recent-unwrapped", "detection"),
+        default="recent-unwrapped",
+        help="Herdr read source (default: recent-unwrapped)",
+    )
+
+    p_pane_send = pane_sub.add_parser(
+        "send",
+        parents=[common],
+        help="Send a prompt to a worker pane inside the caller's tab",
+    )
+    p_pane_send.add_argument("target", help="Pane ID (w1:p2 or p2), 1-based index, or agent name")
+    p_pane_send.add_argument(
+        "--prompt",
+        required=True,
+        help="Prompt text, or `-` to read from stdin",
+    )
+    p_pane_send.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait for agent completion via `herdr agent prompt --wait`",
+    )
+    p_pane_send.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Wait timeout in seconds when --wait is set (default: 120)",
+    )
+    p_pane_send.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow sending to self or busy agent",
+    )
+    p_pane_send.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate without sending input",
+    )
+
+    p_pane_wait = pane_sub.add_parser(
+        "wait",
+        parents=[common],
+        help="Wait for worker panes in the caller's tab to enter target states",
+    )
+    p_pane_wait.add_argument(
+        "--until",
+        default=",".join(DEFAULT_WAIT_STATES),
+        help="Comma-separated target states (default: blocked,done)",
+    )
+    p_pane_wait.add_argument("--target", help="Watch only one pane ID, index, or agent name")
+    p_pane_wait.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        help="Timeout in seconds (default: 300)",
+    )
+    p_pane_wait.add_argument(
+        "--verify-busy",
+        action="store_true",
+        help="Verify Claude background tasks",
+    )
+
+    p_pane_close = pane_sub.add_parser(
+        "close",
+        parents=[common],
+        help="Close a non-primary worker pane inside the caller's tab",
+    )
+    p_pane_close.add_argument("target", help="Worker pane ID (w1:p2 or p2), index, or agent name")
+    p_pane_close.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate without closing pane",
+    )
+
+    parser._subcommand_help_map = {"tab": p_tab, "pane": p_pane}  # type: ignore[attr-defined]
     return parser
 
 
@@ -340,6 +688,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not getattr(ns, "command", None):
         parser.print_help(sys.stdout)
         return EXIT_OK
+
+    if ns.command in {"tab", "pane"}:
+        sub_attr = f"{ns.command}_command"
+        if not getattr(ns, sub_attr, None):
+            help_map = getattr(parser, "_subcommand_help_map", {})
+            if ns.command in help_map:
+                help_map[ns.command].print_help(sys.stdout)
+            else:
+                parser.print_help(sys.stdout)
+            return EXIT_OK
 
     self_workspace_id = env.get("HERDR_WORKSPACE_ID") or None
 
@@ -540,10 +898,383 @@ def _dispatch(
         )
         return format_send(result, mode)
 
+    if cmd == "tab":
+        return _dispatch_tab(ns, client, env, mode)
+
+    if cmd == "pane":
+        return _dispatch_pane(ns, client, env, mode)
+
     raise CliError(
         "UNKNOWN_COMMAND",
         f"Unsupported command {cmd!r}.",
         "Run `herdr-spaces-status --help`.",
+        exit_code=EXIT_USAGE,
+    )
+
+
+def _resolve_cap(explicit: int | None, env: Mapping[str, str], env_var: str, default: int) -> int:
+    if explicit is not None:
+        if explicit < 0:
+            raise CliError(
+                "INVALID_CAP",
+                f"Cap limit cannot be negative: {explicit}.",
+                "Pass 0 for unlimited or a positive integer.",
+                exit_code=EXIT_USAGE,
+            )
+        return explicit
+    raw_val = env.get(env_var, "").strip()
+    if not raw_val:
+        return default
+    try:
+        parsed = int(raw_val)
+    except ValueError as exc:
+        raise CliError(
+            "INVALID_CAP",
+            f"Environment variable {env_var}={raw_val!r} must be an integer.",
+            f"Set {env_var} to 0 or a positive integer.",
+            exit_code=EXIT_USAGE,
+        ) from exc
+    if parsed < 0:
+        raise CliError(
+            "INVALID_CAP",
+            f"Environment variable {env_var}={parsed} cannot be negative.",
+            f"Set {env_var} to 0 or a positive integer.",
+            exit_code=EXIT_USAGE,
+        )
+    return parsed
+
+
+def _resolve_default_cwd(explicit_cwd: str | None, fallback_pane: PaneInfo | None) -> str:
+    if explicit_cwd:
+        return explicit_cwd
+    if fallback_pane and fallback_pane.cwd:
+        return fallback_pane.cwd
+    return os.getcwd()
+
+
+def _dispatch_tab(
+    ns: argparse.Namespace,
+    client: HerdrSocketClient,
+    env: dict[str, str],
+    mode: OutputMode,
+) -> str:
+    sub = ns.tab_command
+    raw_snap = client.snapshot()
+    caller = resolve_caller_context(raw_snap, env)
+    tabs = parse_workspace_tabs(
+        raw_snap,
+        caller.workspace_id,
+        self_tab_id=caller.tab_id,
+        self_pane_id=caller.pane_id,
+    )
+
+    if sub == "list":
+        if ns.verify_busy:
+            tabs = verify_tabs_claude_busy(tabs, client.read_detection)
+        return format_tab_list(caller, tabs, mode)
+
+    if sub == "spawn":
+        if ns.ready_timeout <= 0:
+            raise CliError(
+                "INVALID_TIMEOUT",
+                "--ready-timeout must be positive.",
+                "Pass e.g. `--ready-timeout 45`.",
+                exit_code=EXIT_USAGE,
+            )
+        prompt = _read_prompt_arg(ns.prompt, sys.stdin.isatty()) if ns.prompt is not None else None
+        caller_tab = next((t for t in tabs if t.tab_id == caller.tab_id), None)
+        caller_pane = (
+            next((p for p in caller_tab.panes if p.pane_id == caller.pane_id), None)
+            if caller_tab
+            else None
+        )
+        cwd = _resolve_default_cwd(ns.cwd, caller_pane)
+        plan = plan_tab_spawn(
+            caller=caller,
+            tabs=tabs,
+            label=ns.label,
+            cwd=cwd,
+            launcher_name=ns.launcher,
+            prompt=prompt,
+            max_sub_tabs=_resolve_cap(
+                ns.max_sub_tabs, env, "HSS_MAX_SUB_TABS", DEFAULT_MAX_SUB_TABS
+            ),
+            max_space_agents=_resolve_cap(
+                ns.max_space_agents, env, "HSS_MAX_SPACE_AGENTS", DEFAULT_MAX_SPACE_AGENTS
+            ),
+            max_session_agents=_resolve_cap(
+                ns.max_session_agents, env, "HSS_MAX_SESSION_AGENTS", DEFAULT_MAX_SESSION_AGENTS
+            ),
+            session_working_agents=count_session_working_agents(raw_snap),
+            existing_agent_names=collect_live_agent_names(raw_snap),
+        )
+        result = execute_tab_spawn(
+            plan,
+            client=client,
+            create_tab=tab_create,
+            run_pane=pane_run,
+            start_agent=agent_start,
+            prompt_fn=agent_prompt,
+            env=env,
+            select_backend=ai_agent_select_backend,
+            dry_run=bool(ns.dry_run),
+            ready_timeout=float(ns.ready_timeout),
+        )
+        return format_tab_spawn(result, mode)
+
+    if sub == "peek":
+        if ns.lines <= 0:
+            raise CliError(
+                "INVALID_LINES",
+                "--lines must be a positive integer.",
+                "Pass e.g. `--lines 40`.",
+                exit_code=EXIT_USAGE,
+            )
+        tab = resolve_tab_target(tabs, ns.target)
+        if tab.primary_pane is None:
+            raise CliError(
+                "NO_PRIMARY_PANE",
+                f"Tab {tab.tab_id} ({tab.base_label}) has no primary pane.",
+                "Inspect the tab in Herdr.",
+            )
+        pane = tab.primary_pane
+        read = client.read_pane(
+            pane.pane_id,
+            has_agent=pane.agent_kind is not None,
+            source=ns.source,
+            lines=ns.lines,
+        )
+        return format_peek(
+            PeekResult(
+                workspace_id=caller.workspace_id,
+                label=tab.base_label,
+                tab_id=tab.tab_id,
+                pane_id=pane.pane_id,
+                agent_kind=pane.agent_kind,
+                agent_status=pane.effective_status,
+                source=ns.source,
+                lines=ns.lines,
+                text=str(read["text"]),
+            ),
+            mode,
+        )
+
+    if sub == "send":
+        if ns.timeout <= 0:
+            raise CliError(
+                "INVALID_TIMEOUT",
+                "--timeout must be positive.",
+                "Pass e.g. `--timeout 120`.",
+                exit_code=EXIT_USAGE,
+            )
+        prompt = _read_prompt_arg(ns.prompt, sys.stdin.isatty())
+        tab = resolve_tab_target(tabs, ns.target)
+        if tab.primary_pane and tab.primary_pane.agent_kind == "claude":
+            tab = verify_tabs_claude_busy([tab], client.read_detection)[0]
+        result = execute_tab_send(
+            caller=caller,
+            tab=tab,
+            prompt=prompt,
+            wait=bool(ns.wait),
+            timeout=float(ns.timeout),
+            force=bool(ns.force),
+            dry_run=bool(ns.dry_run),
+            prompt_fn=agent_prompt,
+        )
+        return format_send(result, mode)
+
+    if sub == "wait":
+        if ns.timeout <= 0:
+            raise CliError(
+                "INVALID_TIMEOUT",
+                "--timeout must be positive.",
+                "Pass e.g. `--timeout 300`.",
+                exit_code=EXIT_USAGE,
+            )
+        until = _parse_until(ns.until)
+        result = execute_tab_wait(
+            client=client,
+            caller=caller,
+            until=until,
+            target=ns.target,
+            timeout=float(ns.timeout),
+            verify_busy=bool(ns.verify_busy),
+        )
+        return format_tab_wait(result, mode)
+
+    if sub == "close":
+        tab = resolve_tab_target(tabs, ns.target)
+        result = execute_tab_close(
+            caller=caller,
+            tab=tab,
+            dry_run=bool(ns.dry_run),
+            close_tab=tab_close,
+        )
+        return format_tab_close(result, mode)
+
+    raise CliError(
+        "UNKNOWN_COMMAND",
+        f"Unsupported tab command {sub!r}.",
+        "Run `hss tab --help`.",
+        exit_code=EXIT_USAGE,
+    )
+
+
+def _dispatch_pane(
+    ns: argparse.Namespace,
+    client: HerdrSocketClient,
+    env: dict[str, str],
+    mode: OutputMode,
+) -> str:
+    sub = ns.pane_command
+    raw_snap = client.snapshot()
+    caller = resolve_caller_context(raw_snap, env)
+    tabs = parse_workspace_tabs(
+        raw_snap,
+        caller.workspace_id,
+        self_tab_id=caller.tab_id,
+        self_pane_id=caller.pane_id,
+    )
+    tab = next(t for t in tabs if t.tab_id == caller.tab_id)
+
+    if sub == "list":
+        panes = list(tab.panes)
+        if ns.verify_busy:
+            panes = verify_panes_claude_busy(panes, client.read_detection)
+        return format_pane_list(caller, tab, panes, mode)
+
+    if sub == "spawn":
+        if ns.ready_timeout <= 0:
+            raise CliError(
+                "INVALID_TIMEOUT",
+                "--ready-timeout must be positive.",
+                "Pass e.g. `--ready-timeout 45`.",
+                exit_code=EXIT_USAGE,
+            )
+        prompt = _read_prompt_arg(ns.prompt, sys.stdin.isatty()) if ns.prompt is not None else None
+        caller_pane = next((p for p in tab.panes if p.pane_id == caller.pane_id), None)
+        cwd = _resolve_default_cwd(ns.cwd, caller_pane)
+        plan = plan_pane_spawn(
+            caller=caller,
+            tabs=tabs,
+            cwd=cwd,
+            launcher_name=ns.launcher,
+            direction=ns.direction,
+            shell_cmd=ns.shell_cmd,
+            prompt=prompt,
+            max_worker_panes=_resolve_cap(
+                ns.max_worker_panes, env, "HSS_MAX_WORKER_PANES", DEFAULT_MAX_WORKER_PANES
+            ),
+            max_space_agents=_resolve_cap(
+                ns.max_space_agents, env, "HSS_MAX_SPACE_AGENTS", DEFAULT_MAX_SPACE_AGENTS
+            ),
+            max_session_agents=_resolve_cap(
+                ns.max_session_agents, env, "HSS_MAX_SESSION_AGENTS", DEFAULT_MAX_SESSION_AGENTS
+            ),
+            session_working_agents=count_session_working_agents(raw_snap),
+            existing_agent_names=collect_live_agent_names(raw_snap),
+        )
+        result = execute_pane_spawn(
+            plan,
+            client=client,
+            split_pane=pane_split,
+            run_pane=pane_run,
+            start_agent=agent_start,
+            prompt_fn=agent_prompt,
+            env=env,
+            select_backend=ai_agent_select_backend,
+            dry_run=bool(ns.dry_run),
+            ready_timeout=float(ns.ready_timeout),
+        )
+        return format_pane_spawn(result, mode)
+
+    if sub == "peek":
+        if ns.lines <= 0:
+            raise CliError(
+                "INVALID_LINES",
+                "--lines must be a positive integer.",
+                "Pass e.g. `--lines 40`.",
+                exit_code=EXIT_USAGE,
+            )
+        pane = resolve_pane_target(tab.panes, ns.target)
+        read = client.read_pane(
+            pane.pane_id,
+            has_agent=pane.agent_kind is not None,
+            source=ns.source,
+            lines=ns.lines,
+        )
+        return format_peek(
+            PeekResult(
+                workspace_id=caller.workspace_id,
+                label=tab.base_label,
+                tab_id=tab.tab_id,
+                pane_id=pane.pane_id,
+                agent_kind=pane.agent_kind,
+                agent_status=pane.effective_status,
+                source=ns.source,
+                lines=ns.lines,
+                text=str(read["text"]),
+            ),
+            mode,
+        )
+
+    if sub == "send":
+        if ns.timeout <= 0:
+            raise CliError(
+                "INVALID_TIMEOUT",
+                "--timeout must be positive.",
+                "Pass e.g. `--timeout 120`.",
+                exit_code=EXIT_USAGE,
+            )
+        prompt = _read_prompt_arg(ns.prompt, sys.stdin.isatty())
+        pane = resolve_pane_target(tab.panes, ns.target)
+        if pane.agent_kind == "claude":
+            pane = verify_panes_claude_busy([pane], client.read_detection)[0]
+        result = execute_pane_send(
+            caller=caller,
+            pane=pane,
+            prompt=prompt,
+            wait=bool(ns.wait),
+            timeout=float(ns.timeout),
+            force=bool(ns.force),
+            dry_run=bool(ns.dry_run),
+            prompt_fn=agent_prompt,
+        )
+        return format_send(result, mode)
+
+    if sub == "wait":
+        if ns.timeout <= 0:
+            raise CliError(
+                "INVALID_TIMEOUT",
+                "--timeout must be positive.",
+                "Pass e.g. `--timeout 300`.",
+                exit_code=EXIT_USAGE,
+            )
+        until = _parse_until(ns.until)
+        result = execute_pane_wait(
+            client=client,
+            caller=caller,
+            until=until,
+            target=ns.target,
+            timeout=float(ns.timeout),
+            verify_busy=bool(ns.verify_busy),
+        )
+        return format_pane_wait(result, mode)
+
+    if sub == "close":
+        pane = resolve_pane_target(tab.panes, ns.target)
+        result = execute_pane_close(
+            caller=caller,
+            pane=pane,
+            dry_run=bool(ns.dry_run),
+            close_pane=pane_close,
+        )
+        return format_pane_close(result, mode)
+
+    raise CliError(
+        "UNKNOWN_COMMAND",
+        f"Unsupported pane command {sub!r}.",
+        "Run `hss pane --help`.",
         exit_code=EXIT_USAGE,
     )
 

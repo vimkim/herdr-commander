@@ -79,6 +79,40 @@ EOF
 
 Refuses `blocked` agents (`AGENT_BLOCKED`), `working`/`busy_bg` agents without `--force` (`AGENT_BUSY`), and the caller's own workspace without `--force` (`CANNOT_SEND_TO_SELF`).
 
+### `tab` (Space Leader)
+
+Manage worker sub-tabs inside the caller's own Space (up to 8 sub-tabs by default, total 9 tabs matching `Alt+Shift+1..9`). Enforces Space Leader identity (`tabs[0]`, `panes[0]`, not `HERDR_TAB_ROLE=worker` or `HERDR_PANE_ROLE=worker`) and tags created tabs with `HERDR_TAB_ROLE=worker` to block recursive tab spawning.
+
+```bash
+hss tab list --verify-busy
+hss tab spawn --label review --launcher ai-agent --prompt "Review current diff." --json
+hss tab wait --until blocked,done --verify-busy --json
+hss tab peek review --lines 60
+hss tab send review --prompt "Check edge cases." --json
+hss tab close review
+```
+
+### `pane` (Tab Leader)
+
+Manage worker panes inside the caller's own tab (up to 3 worker panes by default, forming a 2×2 grid). Allowed for Space/Tab Leaders (`panes[0]`, not `HERDR_PANE_ROLE=worker`); tags split panes with `HERDR_PANE_ROLE=worker`.
+
+```bash
+hss pane list --verify-busy
+hss pane spawn --launcher ai-agent --prompt "Audit tests." --json
+hss pane spawn --launcher shell --cmd "just test" --json
+hss pane wait --until blocked,done --verify-busy --json
+hss pane peek p2 --lines 60
+hss pane send p2 --prompt "Summarize failures." --json
+hss pane close p2
+```
+
+Default limits (override via CLI flags or environment variables; `0` = unlimited):
+
+- `HSS_MAX_SUB_TABS=8`: max non-primary sub-tabs per Space (`hss tab spawn --max-sub-tabs`).
+- `HSS_MAX_WORKER_PANES=3`: max non-primary worker panes per tab (`hss pane spawn --max-worker-panes`).
+- `HSS_MAX_SPACE_AGENTS=4`: max live non-primary AI agents per Space (`--max-space-agents`; `--launcher shell` bypasses).
+- `HSS_MAX_SESSION_AGENTS=10`: max currently working AI agents across the Herdr session (`--max-session-agents`; `--launcher shell` bypasses).
+
 ## JSON Contract and Exit Codes
 
 Under `--json`, stdout emits only:

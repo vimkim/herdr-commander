@@ -550,6 +550,119 @@ def pane_run(pane_id: str, command: str, *, timeout: float = 15.0) -> None:
     )
 
 
+def tab_create(
+    workspace_id: str,
+    *,
+    label: str,
+    cwd: str,
+    env_vars: Mapping[str, str] | None = None,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Create a non-focused sub-tab inside a Herdr workspace."""
+    args = [
+        "herdr",
+        "tab",
+        "create",
+        "--workspace",
+        workspace_id,
+        "--cwd",
+        cwd,
+        "--label",
+        label,
+        "--no-focus",
+    ]
+    for key, value in sorted((env_vars or {}).items()):
+        args.extend(["--env", f"{key}={value}"])
+    raw = _run_subprocess(
+        args,
+        timeout=timeout,
+        error_code="TAB_CREATE_FAILED",
+        fix=f"Verify workspace {workspace_id} and directory {cwd} exist.",
+    )
+    try:
+        data = json.loads(raw)["result"]
+        tab = data["tab"]
+        pane = data["root_pane"]
+        return {
+            "workspace_id": tab.get("workspace_id", workspace_id),
+            "tab_id": tab["tab_id"],
+            "pane_id": pane["pane_id"],
+            "label": tab.get("label", label),
+            "cwd": cwd,
+        }
+    except (ValueError, KeyError, TypeError) as exc:
+        raise CliError(
+            "TAB_CREATE_FAILED",
+            "Unexpected JSON response from `herdr tab create`.",
+            "Run `hss tab list` to inspect workspace tabs.",
+        ) from exc
+
+
+def tab_close(tab_id: str, *, timeout: float = 15.0) -> None:
+    """Close a Herdr tab by ID."""
+    _run_subprocess(
+        ["herdr", "tab", "close", tab_id],
+        timeout=timeout,
+        error_code="TAB_CLOSE_FAILED",
+        fix=f"Verify tab {tab_id} exists with `hss tab list`.",
+    )
+
+
+def pane_split(
+    target_pane_id: str,
+    *,
+    direction: str,
+    cwd: str,
+    env_vars: Mapping[str, str] | None = None,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Split an existing pane without shifting UI focus."""
+    args = [
+        "herdr",
+        "pane",
+        "split",
+        "--pane",
+        target_pane_id,
+        "--direction",
+        direction,
+        "--cwd",
+        cwd,
+        "--no-focus",
+    ]
+    for key, value in sorted((env_vars or {}).items()):
+        args.extend(["--env", f"{key}={value}"])
+    raw = _run_subprocess(
+        args,
+        timeout=timeout,
+        error_code="PANE_SPLIT_FAILED",
+        fix=f"Verify pane {target_pane_id} and directory {cwd} exist.",
+    )
+    try:
+        pane = json.loads(raw)["result"]["pane"]
+        return {
+            "pane_id": pane["pane_id"],
+            "tab_id": pane.get("tab_id"),
+            "workspace_id": pane.get("workspace_id"),
+            "cwd": cwd,
+        }
+    except (ValueError, KeyError, TypeError) as exc:
+        raise CliError(
+            "PANE_SPLIT_FAILED",
+            "Unexpected JSON response from `herdr pane split`.",
+            "Run `hss pane list` to inspect current tab panes.",
+        ) from exc
+
+
+def pane_close(pane_id: str, *, timeout: float = 15.0) -> None:
+    """Close a Herdr pane by ID."""
+    _run_subprocess(
+        ["herdr", "pane", "close", pane_id],
+        timeout=timeout,
+        error_code="PANE_CLOSE_FAILED",
+        fix=f"Verify pane {pane_id} exists with `hss pane list`.",
+    )
+
+
 def agent_start(
     name: str,
     kind: str,

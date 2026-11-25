@@ -9,7 +9,12 @@ Act strictly as the coordinator in your own Herdr workspace. Execute **all** wor
 
 - **All tasks run in Herdr workspaces + tabs**: Dispatch every piece of task work — implementation, debugging, investigation, code review, builds, tests, docs, or PR/CI work — into a Herdr workspace (Tab 1 via `hss ensure` and `hss send`) and its Herdr tabs. Never perform task work directly in the commander session or bypass Herdr with in-process subagents or swarms.
 - **Commander session scope**: Keep this session strictly on coordination — reconciling schedules and trackers, checking status, ensuring workspaces, sending briefs, waiting on events, peeking output, updating `work-tracker` / daily sheets, and reporting to the user.
-- **First-tab delegation, sub-tab autonomy**: Manage each worker workspace through its first tab (`tabs[0]`) and let that first-tab agent create and control extra Herdr tabs inside its workspace for parallel work, builds, tests, or helper agents, passing a short role `--label` (for example `build`, `test`, `review`, or `ci`) when creating extra tabs.
+- **3-tier hierarchy & hard caps**:
+  - **Commander** (this session): manages Spaces via `hss status` / `ensure` / `send` / `wait` / `peek`.
+  - **Space Leader** (`tabs[0]`, `panes[0]`): manages its own Space and may spawn up to **8 sub-tabs** (9 tabs total) via `hss tab spawn --label <role>` (`ai-agent` default; default guards of 4 live non-primary AI agents per Space and 10 working agents session-wide; `--launcher shell` unrestricted within the 8-tab cap).
+  - **Tab Leader** (`tabs[1..8]`, `panes[0]`): may split up to **3 worker panes** (2×2 grid) inside its own tab via `hss pane spawn`; never creates new tabs.
+  - **Leaf Worker** (`panes[1..]`): executes assigned work; never creates tabs or splits panes.
+- **Context-size management**: Simple, quick checks can be handled directly, but **Commander, Space Leaders, and Tab Leaders should prefer delegating substantial, exploratory, noisy, or multi-step work** to Herdr workspaces/tabs (`hss tab`), worker panes (`hss pane`), or in-process subagents (within Space/Tab Leaders) so each leader keeps its context window compact and focused on orchestration and synthesis.
 
 Delegate sibling concerns to existing skills rather than duplicating their rules.
 
@@ -78,7 +83,7 @@ Send the kickoff brief to Tab 1 via stdin so multiline text needs no shell escap
 hss send <ws> --prompt - --json <<'EOF'
 Objective: <concise goal and acceptance criteria>.
 Tracker ID: <work-tracker ID or none>.
-Workspace execution: Carry out all task work inside this Herdr workspace, using extra Herdr tabs in this workspace as needed for builds, tests, or helper agents. Pass a short role --label (for example build, test, review, or ci) whenever creating an extra tab with herdr tab create.
+Workspace execution: Use `hss tab` inside this workspace for parallel work, builds, tests, or helper agents (up to 8 sub-tabs, short role `--label` such as build, test, review, or ci, `ai-agent` default for AI workers, `--launcher shell` for commands). Keep your own context window lean by delegating substantial, noisy, or exploratory work to sub-tabs or subagents while handling trivial steps directly. Keep same-worktree edits to one agent at a time, and close finished sub-tabs you created with `hss tab close`.
 Reporting rule: Keep final findings, verification evidence (commits, test runs, PR or doc paths), and blockers summarized in this first tab.
 EOF
 ```
