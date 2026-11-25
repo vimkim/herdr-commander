@@ -111,7 +111,7 @@ def run_cli(
     if env:
         merged_env.update(env)
     return subprocess.run(
-        [sys.executable, "-m", "herdr_spaces_status", *args],
+        [sys.executable, "-m", "herdr_commander", *args],
         cwd=str(REPO_ROOT),
         env=merged_env,
         input=stdin_text,

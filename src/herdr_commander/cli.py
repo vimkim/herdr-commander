@@ -1,4 +1,4 @@
-"""CLI entry point for herdr-spaces-status (hss)."""
+"""CLI entry point for herdr-commander (hcmd)."""
 
 from __future__ import annotations
 
@@ -105,12 +105,12 @@ Exit codes:
   130  Interrupted (SIGINT)
 
 Examples:
-  hss status --workers-only --verify-busy --with-tracker
-  hss status --plain --fields number,workspace_id,attention,label
-  hss peek w1 --lines 40
-  hss wait --until blocked,done --timeout 300 --verify-busy --json
-  hss ensure --ticket CBRD-10002 --launcher ai-agent --json
-  hss send w1 --prompt "Summarize findings in tab 1." --json
+  hcmd status --workers-only --verify-busy --with-tracker
+  hcmd status --plain --fields number,workspace_id,attention,label
+  hcmd peek w1 --lines 40
+  hcmd wait --until blocked,done --timeout 300 --verify-busy --json
+  hcmd ensure --ticket CBRD-10002 --launcher ai-agent --json
+  hcmd send w1 --prompt "Summarize findings in tab 1." --json
 """
 
 
@@ -147,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the top-level CLI argument parser."""
     common = _build_common_parent()
     parser = argparse.ArgumentParser(
-        prog="herdr-spaces-status",
+        prog="herdr-commander",
         description="Inspect and orchestrate Herdr workspaces by their first-tab agent.",
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -907,12 +907,17 @@ def _dispatch(
     raise CliError(
         "UNKNOWN_COMMAND",
         f"Unsupported command {cmd!r}.",
-        "Run `herdr-spaces-status --help`.",
+        "Run `hcmd --help`.",
         exit_code=EXIT_USAGE,
     )
 
 
-def _resolve_cap(explicit: int | None, env: Mapping[str, str], env_var: str, default: int) -> int:
+def _resolve_cap(
+    explicit: int | None,
+    env: Mapping[str, str],
+    env_vars: tuple[str, ...],
+    default: int,
+) -> int:
     if explicit is not None:
         if explicit < 0:
             raise CliError(
@@ -922,26 +927,28 @@ def _resolve_cap(explicit: int | None, env: Mapping[str, str], env_var: str, def
                 exit_code=EXIT_USAGE,
             )
         return explicit
-    raw_val = env.get(env_var, "").strip()
-    if not raw_val:
-        return default
-    try:
-        parsed = int(raw_val)
-    except ValueError as exc:
-        raise CliError(
-            "INVALID_CAP",
-            f"Environment variable {env_var}={raw_val!r} must be an integer.",
-            f"Set {env_var} to 0 or a positive integer.",
-            exit_code=EXIT_USAGE,
-        ) from exc
-    if parsed < 0:
-        raise CliError(
-            "INVALID_CAP",
-            f"Environment variable {env_var}={parsed} cannot be negative.",
-            f"Set {env_var} to 0 or a positive integer.",
-            exit_code=EXIT_USAGE,
-        )
-    return parsed
+    for env_var in env_vars:
+        raw_val = env.get(env_var, "").strip()
+        if not raw_val:
+            continue
+        try:
+            parsed = int(raw_val)
+        except ValueError as exc:
+            raise CliError(
+                "INVALID_CAP",
+                f"Environment variable {env_var}={raw_val!r} must be an integer.",
+                f"Set {env_var} to 0 or a positive integer.",
+                exit_code=EXIT_USAGE,
+            ) from exc
+        if parsed < 0:
+            raise CliError(
+                "INVALID_CAP",
+                f"Environment variable {env_var}={parsed} cannot be negative.",
+                f"Set {env_var} to 0 or a positive integer.",
+                exit_code=EXIT_USAGE,
+            )
+        return parsed
+    return default
 
 
 def _resolve_default_cwd(explicit_cwd: str | None, fallback_pane: PaneInfo | None) -> str:
@@ -997,13 +1004,22 @@ def _dispatch_tab(
             launcher_name=ns.launcher,
             prompt=prompt,
             max_sub_tabs=_resolve_cap(
-                ns.max_sub_tabs, env, "HSS_MAX_SUB_TABS", DEFAULT_MAX_SUB_TABS
+                ns.max_sub_tabs,
+                env,
+                ("HCMD_MAX_SUB_TABS", "HSS_MAX_SUB_TABS"),
+                DEFAULT_MAX_SUB_TABS,
             ),
             max_space_agents=_resolve_cap(
-                ns.max_space_agents, env, "HSS_MAX_SPACE_AGENTS", DEFAULT_MAX_SPACE_AGENTS
+                ns.max_space_agents,
+                env,
+                ("HCMD_MAX_SPACE_AGENTS", "HSS_MAX_SPACE_AGENTS"),
+                DEFAULT_MAX_SPACE_AGENTS,
             ),
             max_session_agents=_resolve_cap(
-                ns.max_session_agents, env, "HSS_MAX_SESSION_AGENTS", DEFAULT_MAX_SESSION_AGENTS
+                ns.max_session_agents,
+                env,
+                ("HCMD_MAX_SESSION_AGENTS", "HSS_MAX_SESSION_AGENTS"),
+                DEFAULT_MAX_SESSION_AGENTS,
             ),
             session_working_agents=count_session_working_agents(raw_snap),
             existing_agent_names=collect_live_agent_names(raw_snap),
@@ -1115,7 +1131,7 @@ def _dispatch_tab(
     raise CliError(
         "UNKNOWN_COMMAND",
         f"Unsupported tab command {sub!r}.",
-        "Run `hss tab --help`.",
+        "Run `hcmd tab --help`.",
         exit_code=EXIT_USAGE,
     )
 
@@ -1163,13 +1179,22 @@ def _dispatch_pane(
             shell_cmd=ns.shell_cmd,
             prompt=prompt,
             max_worker_panes=_resolve_cap(
-                ns.max_worker_panes, env, "HSS_MAX_WORKER_PANES", DEFAULT_MAX_WORKER_PANES
+                ns.max_worker_panes,
+                env,
+                ("HCMD_MAX_WORKER_PANES", "HSS_MAX_WORKER_PANES"),
+                DEFAULT_MAX_WORKER_PANES,
             ),
             max_space_agents=_resolve_cap(
-                ns.max_space_agents, env, "HSS_MAX_SPACE_AGENTS", DEFAULT_MAX_SPACE_AGENTS
+                ns.max_space_agents,
+                env,
+                ("HCMD_MAX_SPACE_AGENTS", "HSS_MAX_SPACE_AGENTS"),
+                DEFAULT_MAX_SPACE_AGENTS,
             ),
             max_session_agents=_resolve_cap(
-                ns.max_session_agents, env, "HSS_MAX_SESSION_AGENTS", DEFAULT_MAX_SESSION_AGENTS
+                ns.max_session_agents,
+                env,
+                ("HCMD_MAX_SESSION_AGENTS", "HSS_MAX_SESSION_AGENTS"),
+                DEFAULT_MAX_SESSION_AGENTS,
             ),
             session_working_agents=count_session_working_agents(raw_snap),
             existing_agent_names=collect_live_agent_names(raw_snap),
@@ -1274,7 +1299,7 @@ def _dispatch_pane(
     raise CliError(
         "UNKNOWN_COMMAND",
         f"Unsupported pane command {sub!r}.",
-        "Run `hss pane --help`.",
+        "Run `hcmd pane --help`.",
         exit_code=EXIT_USAGE,
     )
 

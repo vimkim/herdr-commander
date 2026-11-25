@@ -179,7 +179,7 @@ class HerdrSocketClient:
             raise CliError(
                 "HERDR_INVALID_RESPONSE",
                 f"Malformed read response for pane {pane_id}.",
-                "Verify the pane still exists with `herdr-spaces-status status`.",
+                "Verify the pane still exists with `hcmd status`.",
             )
         if read.get("pane_id") != pane_id:
             raise CliError(
@@ -435,7 +435,7 @@ def create_workspace_cwd(label: str, cwd: str, *, timeout: float = 15.0) -> dict
         raise CliError(
             "WORKSPACE_CREATE_FAILED",
             "Unexpected JSON response from `herdr workspace create`.",
-            "Run `herdr-spaces-status status` to verify whether the workspace was created.",
+            "Run `hcmd status` to verify whether the workspace was created.",
         ) from exc
 
 
@@ -485,7 +485,7 @@ def _parse_cubrid_worktree_result(raw: str) -> dict[str, Any]:
         raise CliError(
             "CUBRID_WORKTREE_FAILED",
             "Could not parse JSON output from `cubrid-worktree`.",
-            "Run `cubrid-worktree list --json` and `hss status` to check created state.",
+            "Run `cubrid-worktree list --json` and `hcmd status` to check created state.",
         ) from exc
 
 
@@ -594,7 +594,7 @@ def tab_create(
         raise CliError(
             "TAB_CREATE_FAILED",
             "Unexpected JSON response from `herdr tab create`.",
-            "Run `hss tab list` to inspect workspace tabs.",
+            "Run `hcmd tab list` to inspect workspace tabs.",
         ) from exc
 
 
@@ -604,7 +604,7 @@ def tab_close(tab_id: str, *, timeout: float = 15.0) -> None:
         ["herdr", "tab", "close", tab_id],
         timeout=timeout,
         error_code="TAB_CLOSE_FAILED",
-        fix=f"Verify tab {tab_id} exists with `hss tab list`.",
+        fix=f"Verify tab {tab_id} exists with `hcmd tab list`.",
     )
 
 
@@ -649,7 +649,7 @@ def pane_split(
         raise CliError(
             "PANE_SPLIT_FAILED",
             "Unexpected JSON response from `herdr pane split`.",
-            "Run `hss pane list` to inspect current tab panes.",
+            "Run `hcmd pane list` to inspect current tab panes.",
         ) from exc
 
 
@@ -659,7 +659,7 @@ def pane_close(pane_id: str, *, timeout: float = 15.0) -> None:
         ["herdr", "pane", "close", pane_id],
         timeout=timeout,
         error_code="PANE_CLOSE_FAILED",
-        fix=f"Verify pane {pane_id} exists with `hss pane list`.",
+        fix=f"Verify pane {pane_id} exists with `hcmd pane list`.",
     )
 
 
@@ -691,7 +691,7 @@ def agent_start(
         args,
         timeout=max(10.0, timeout_ms / 1000.0 + 10.0),
         error_code="AGENT_START_FAILED",
-        fix=f"Inspect pane {pane_id} with `herdr-spaces-status peek` before retrying.",
+        fix=f"Inspect pane {pane_id} with `hcmd peek` before retrying.",
     )
     try:
         return json.loads(raw).get("result", {})
@@ -717,7 +717,7 @@ def agent_prompt(
         args,
         timeout=proc_timeout,
         error_code="AGENT_PROMPT_FAILED",
-        fix="Inspect the agent pane with `herdr-spaces-status peek` before resending.",
+        fix="Inspect the agent pane with `hcmd peek` before resending.",
     )
     try:
         return json.loads(raw).get("result", {})

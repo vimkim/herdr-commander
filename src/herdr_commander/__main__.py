@@ -1,4 +1,4 @@
-"""Module runner for `python3 -m herdr_spaces_status`."""
+"""Module runner for `python3 -m herdr_commander`."""
 
 from __future__ import annotations
 

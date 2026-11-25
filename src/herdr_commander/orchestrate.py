@@ -351,7 +351,7 @@ def resolve_backend_agent(backend: str) -> str:
         raise CliError(
             "AI_AGENT_UNKNOWN_BACKEND",
             f"ai-agent selected unsupported backend {backend!r}.",
-            f"Expected one of: {', '.join(AI_AGENT_BACKEND_AGENTS)}. Update hss or ai-agent.",
+            f"Expected one of: {', '.join(AI_AGENT_BACKEND_AGENTS)}. Update hcmd or ai-agent.",
             details={"backend": backend},
         )
     return agent
@@ -391,7 +391,7 @@ def plan_ensure(
         raise CliError(
             "MISSING_TARGET",
             "Specify --label, --cwd, --ticket, or --pr.",
-            "Provide a target workspace or directory, e.g. `hss ensure --ticket CBRD-10002`.",
+            "Provide a target workspace or directory, e.g. `hcmd ensure --ticket CBRD-10002`.",
             exit_code=EXIT_USAGE,
         )
 
@@ -561,7 +561,7 @@ def execute_ensure(
         raise CliError(
             "ENSURE_SPACE_MISSING",
             f"Could not locate ensured workspace {plan.label!r} in Herdr snapshot.",
-            "Run `herdr-spaces-status status` to inspect created workspaces.",
+            "Run `hcmd status` to inspect created workspaces.",
         )
 
     pane = target_space.primary_pane
@@ -665,7 +665,7 @@ def _wait_for_launched_agent(
                             f"Launched agent {pane.agent_kind} is blocked at startup "
                             f"in {pane.pane_id}."
                         ),
-                        f"Inspect it with `herdr-spaces-status peek {workspace_id}`.",
+                        f"Inspect it with `hcmd peek {workspace_id}`.",
                         details={"workspace_id": workspace_id, "pane_id": pane.pane_id},
                     )
                 if pane.interactive_ready or pane.raw_status in {"idle", "done"}:
@@ -677,7 +677,7 @@ def _wait_for_launched_agent(
                     f"Timed out after {timeout:.0f}s waiting for {expected_label} "
                     f"in workspace {workspace_id}."
                 ),
-                f"Inspect the pane with `herdr-spaces-status peek {workspace_id}` before retrying.",
+                f"Inspect the pane with `hcmd peek {workspace_id}` before retrying.",
                 details={
                     "workspace_id": workspace_id,
                     "pane_id": last_space.primary_pane.pane_id
@@ -731,20 +731,20 @@ def validate_send(space: SpaceSnapshot, *, prompt: str, force: bool) -> None:
         raise CliError(
             "NO_AGENT",
             f"Workspace {space.workspace_id} ({space.label}) has no agent in its first tab.",
-            "Launch an agent first with `herdr-spaces-status ensure`.",
+            "Launch an agent first with `hcmd ensure`.",
         )
     if pane.effective_status == "blocked":
         raise CliError(
             "AGENT_BLOCKED",
             f"Agent in {space.label} ({pane.pane_id}) is blocked waiting for approval or input.",
-            f"Inspect the dialog with `herdr-spaces-status peek {space.workspace_id}` first.",
+            f"Inspect the dialog with `hcmd peek {space.workspace_id}` first.",
             details={"workspace_id": space.workspace_id, "pane_id": pane.pane_id},
         )
     if pane.effective_status in {"working", "busy_bg"} and not force:
         raise CliError(
             "AGENT_BUSY",
             (f"Agent in {space.label} ({pane.pane_id}) is currently {pane.effective_status}."),
-            "Wait for completion with `herdr-spaces-status wait`, or pass --force.",
+            "Wait for completion with `hcmd wait`, or pass --force.",
             details={"workspace_id": space.workspace_id, "pane_id": pane.pane_id},
         )
 
@@ -868,7 +868,7 @@ def execute_wait(
     raise CliError(
         "WAIT_TIMEOUT",
         f"Timed out after {timeout:.0f}s waiting for state(s): {', '.join(until_tuple)}.",
-        "Run `herdr-spaces-status status` to inspect current workspace states.",
+        "Run `hcmd status` to inspect current workspace states.",
         exit_code=EXIT_DOMAIN,
     )
 
@@ -892,7 +892,7 @@ def _validate_agent_quota_caps(
             ),
             (
                 "Close or wait for finished worker tabs/panes, use `--launcher shell`, "
-                "or raise `--max-space-agents` / `HSS_MAX_SPACE_AGENTS`."
+                "or raise `--max-space-agents` / `HCMD_MAX_SPACE_AGENTS`."
             ),
             details={"space_agents": space_agents, "max_space_agents": max_space_agents},
         )
@@ -905,7 +905,7 @@ def _validate_agent_quota_caps(
             ),
             (
                 "Wait for active agents to settle, use `--launcher shell`, "
-                "or raise `--max-session-agents` / `HSS_MAX_SESSION_AGENTS`."
+                "or raise `--max-session-agents` / `HCMD_MAX_SESSION_AGENTS`."
             ),
             details={
                 "session_working_agents": session_working_agents,
@@ -1122,7 +1122,7 @@ def plan_tab_spawn(
         raise CliError(
             "NOT_SPACE_LEADER",
             f"Only a Space Leader (tabs[0], panes[0]) may create tabs; caller is {caller.role}.",
-            "Run `hss pane spawn` inside a Tab Leader, or report to Tab 1.",
+            "Run `hcmd pane spawn` inside a Tab Leader, or report to Tab 1.",
             details=caller.to_dict(),
         )
     clean_label = label.strip()
@@ -1165,7 +1165,7 @@ def plan_tab_spawn(
                 f"Workspace {caller.workspace_id} already has {current_sub_tabs} sub-tab(s) "
                 f"(cap: {max_sub_tabs})."
             ),
-            "Close finished sub-tabs with `hss tab close <tab>` before spawning another.",
+            "Close finished sub-tabs with `hcmd tab close <tab>` before spawning another.",
             details={"current_sub_tabs": current_sub_tabs, "max_sub_tabs": max_sub_tabs},
         )
 
@@ -1310,7 +1310,7 @@ def execute_tab_send(
         raise CliError(
             "NOT_SPACE_LEADER",
             f"Only a Space Leader may send prompts across tabs; caller is {caller.role}.",
-            "Report results in your own pane or use `hss pane send` if you are a Tab Leader.",
+            "Report results in your own pane or use `hcmd pane send` if you are a Tab Leader.",
             details=caller.to_dict(),
         )
     return _send_to_pane(
@@ -1326,7 +1326,7 @@ def execute_tab_send(
         prompt_fn=prompt_fn,
         no_agent_message=f"Tab {tab.tab_id} ({tab.base_label}) has no agent in its primary pane.",
         no_agent_fix="Spawn an agent tab or run commands via `herdr pane run`.",
-        peek_fix=f"Inspect tab {tab.tab_id} with `hss tab peek {tab.tab_id}` first.",
+        peek_fix=f"Inspect tab {tab.tab_id} with `hcmd tab peek {tab.tab_id}` first.",
     )
 
 
@@ -1391,7 +1391,7 @@ def execute_tab_wait(
     raise CliError(
         "WAIT_TIMEOUT",
         f"Timed out after {timeout:.0f}s waiting for tab state(s): {', '.join(until_tuple)}.",
-        "Run `hss tab list` to inspect sub-tabs in this workspace.",
+        "Run `hcmd tab list` to inspect sub-tabs in this workspace.",
     )
 
 
@@ -1521,7 +1521,7 @@ def plan_pane_spawn(
                 f"Tab {caller.tab_id} already has {current_worker_panes} worker pane(s) "
                 f"(cap: {max_worker_panes})."
             ),
-            "Close finished worker panes with `hss pane close <pane>` before splitting another.",
+            "Close finished worker panes with `hcmd pane close <pane>` before splitting another.",
             details={
                 "current_worker_panes": current_worker_panes,
                 "max_worker_panes": max_worker_panes,
@@ -1697,7 +1697,7 @@ def execute_pane_send(
         prompt_fn=prompt_fn,
         no_agent_message=f"Pane {pane.pane_id} has no running agent.",
         no_agent_fix=f"Use `herdr pane run {pane.pane_id} ...` for shell panes.",
-        peek_fix=f"Inspect pane {pane.pane_id} with `hss pane peek {pane.pane_id}` first.",
+        peek_fix=f"Inspect pane {pane.pane_id} with `hcmd pane peek {pane.pane_id}` first.",
     )
 
 
@@ -1767,7 +1767,7 @@ def execute_pane_wait(
     raise CliError(
         "WAIT_TIMEOUT",
         f"Timed out after {timeout:.0f}s waiting for pane state(s): {', '.join(until_tuple)}.",
-        "Run `hss pane list` to inspect panes in this tab.",
+        "Run `hcmd pane list` to inspect panes in this tab.",
     )
 
 

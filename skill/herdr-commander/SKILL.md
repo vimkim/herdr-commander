@@ -7,14 +7,14 @@ description: Coordinate all tasks through Herdr workspaces and Herdr tabs by man
 
 Act strictly as the coordinator in your own Herdr workspace. Execute **all** work through Herdr workspaces and Herdr tabs:
 
-- **All tasks run in Herdr workspaces + tabs**: Dispatch every piece of task work — implementation, debugging, investigation, code review, builds, tests, docs, or PR/CI work — into a Herdr workspace (Tab 1 via `hss ensure` and `hss send`) and its Herdr tabs. Never perform task work directly in the commander session or bypass Herdr with in-process subagents or swarms.
+- **All tasks run in Herdr workspaces + tabs**: Dispatch every piece of task work — implementation, debugging, investigation, code review, builds, tests, docs, or PR/CI work — into a Herdr workspace (Tab 1 via `hcmd ensure` and `hcmd send`) and its Herdr tabs. Never perform task work directly in the commander session or bypass Herdr with in-process subagents or swarms.
 - **Commander session scope**: Keep this session strictly on coordination — reconciling schedules and trackers, checking status, ensuring workspaces, sending briefs, waiting on events, peeking output, updating `work-tracker` / daily sheets, and reporting to the user.
 - **3-tier hierarchy & hard caps**:
-  - **Commander** (this session): manages Spaces via `hss status` / `ensure` / `send` / `wait` / `peek`.
-  - **Space Leader** (`tabs[0]`, `panes[0]`): manages its own Space and may spawn up to **8 sub-tabs** (9 tabs total) via `hss tab spawn --label <role>` (`ai-agent` default; default guards of 4 live non-primary AI agents per Space and 10 working agents session-wide; `--launcher shell` unrestricted within the 8-tab cap).
-  - **Tab Leader** (`tabs[1..8]`, `panes[0]`): may split up to **3 worker panes** (2×2 grid) inside its own tab via `hss pane spawn`; never creates new tabs.
+  - **Commander** (this session): manages Spaces via `hcmd status` / `ensure` / `send` / `wait` / `peek` (`hss` works as a compatibility alias).
+  - **Space Leader** (`tabs[0]`, `panes[0]`): manages its own Space and may spawn up to **8 sub-tabs** (9 tabs total) via `hcmd tab spawn --label <role>` (`ai-agent` default; default guards of 4 live non-primary AI agents per Space and 10 working agents session-wide; `--launcher shell` unrestricted within the 8-tab cap).
+  - **Tab Leader** (`tabs[1..8]`, `panes[0]`): may split up to **3 worker panes** (2×2 grid) inside its own tab via `hcmd pane spawn`; never creates new tabs.
   - **Leaf Worker** (`panes[1..]`): executes assigned work; never creates tabs or splits panes.
-- **Context-size management**: Simple, quick checks can be handled directly, but **Commander, Space Leaders, and Tab Leaders should prefer delegating substantial, exploratory, noisy, or multi-step work** to Herdr workspaces/tabs (`hss tab`), worker panes (`hss pane`), or in-process subagents (within Space/Tab Leaders) so each leader keeps its context window compact and focused on orchestration and synthesis.
+- **Context-size management**: Simple, quick checks can be handled directly, but **Commander, Space Leaders, and Tab Leaders should prefer delegating substantial, exploratory, noisy, or multi-step work** to Herdr workspaces/tabs (`hcmd tab`), worker panes (`hcmd pane`), or in-process subagents (within Space/Tab Leaders) so each leader keeps its context window compact and focused on orchestration and synthesis.
 
 Delegate sibling concerns to existing skills rather than duplicating their rules.
 
@@ -28,14 +28,14 @@ Delegate sibling concerns to existing skills rather than duplicating their rules
 Verify `HERDR_ENV=1` and check the CLI:
 
 ```bash
-test "${HERDR_ENV:-}" = 1 && hss --version
+test "${HERDR_ENV:-}" = 1 && hcmd --version
 ```
 
 Inspect today's commitments and live Herdr workspaces before launching anything:
 
 ```bash
 work-tracker todo today --json
-hss status --workers-only --verify-busy --with-tracker --json
+hcmd status --workers-only --verify-busy --with-tracker --json
 ```
 
 Read `daily/today-YYYY-MM-DD.md` and the active weekly sheet per `daily-schedule`.
@@ -71,24 +71,24 @@ Before dispatching several workspaces at once, check quota with `ai-agent --dry-
 Run `ensure` for each assigned task. It reuses matching open workspaces, creates CUBRID worktrees via `cubrid-worktree` or general directories via `herdr-next-to-current`, and waits until the first-tab agent is ready.
 
 ```bash
-hss ensure --ticket CBRD-10002 --launcher ai-agent --json
-hss ensure --cwd ~/gh/my-project --label my-project --launcher ai-agent --json
+hcmd ensure --ticket CBRD-10002 --launcher ai-agent --json
+hcmd ensure --cwd ~/gh/my-project --label my-project --launcher ai-agent --json
 ```
 
-If `ensure` exits with `OCCUPIED_BY_OTHER_AGENT`, inspect the workspace with `hss peek <ws>` instead of overwriting the pane.
+If `ensure` exits with `OCCUPIED_BY_OTHER_AGENT`, inspect the workspace with `hcmd peek <ws>` instead of overwriting the pane.
 
 Send the kickoff brief to Tab 1 via stdin so multiline text needs no shell escaping:
 
 ```bash
-hss send <ws> --prompt - --json <<'EOF'
+hcmd send <ws> --prompt - --json <<'EOF'
 Objective: <concise goal and acceptance criteria>.
 Tracker ID: <work-tracker ID or none>.
-Workspace execution: Use `hss tab` inside this workspace for parallel work, builds, tests, or helper agents (up to 8 sub-tabs, short role `--label` such as build, test, review, or ci, `ai-agent` default for AI workers, `--launcher shell` for commands). Keep your own context window lean by delegating substantial, noisy, or exploratory work to sub-tabs or subagents while handling trivial steps directly. Keep same-worktree edits to one agent at a time, and close finished sub-tabs you created with `hss tab close`.
+Workspace execution: Use `hcmd tab` inside this workspace for parallel work, builds, tests, or helper agents (up to 8 sub-tabs, short role `--label` such as build, test, review, or ci, `ai-agent` default for AI workers, `--launcher shell` for commands). Keep your own context window lean by delegating substantial, noisy, or exploratory work to sub-tabs or subagents while handling trivial steps directly. Keep same-worktree edits to one agent at a time, and close finished sub-tabs you created with `hcmd tab close`.
 Reporting rule: Keep final findings, verification evidence (commits, test runs, PR or doc paths), and blockers summarized in this first tab.
 EOF
 ```
 
-Never pass `--force` to bypass `AGENT_BLOCKED`. Inspect blocked dialogs with `hss peek <ws>` and ask the user before answering approval or question prompts.
+Never pass `--force` to bypass `AGENT_BLOCKED`. Inspect blocked dialogs with `hcmd peek <ws>` and ask the user before answering approval or question prompts.
 
 Completion criterion. Every assigned task shows a ready or working agent in Tab 1, and `work-tracker` notes record the workspace ID.
 
@@ -97,14 +97,14 @@ Completion criterion. Every assigned task shows a ready or working agent in Tab 
 Wait on Herdr socket events instead of sleeping in a polling loop:
 
 ```bash
-hss wait --until blocked,done --timeout 300 --verify-busy --json
+hcmd wait --until blocked,done --timeout 300 --verify-busy --json
 ```
 
 Handle woken workspaces in priority order.
 
-1. Read `blocked` workspaces first with `hss peek <ws> --lines 60`. Forward non-trivial approvals or decisions to the user.
-2. Read `done` workspaces with `hss peek <ws> --lines 60`.
-3. Check `sub_tabs.any_working` and `sub_tabs.any_blocked` from `hss status --workspace <ws> --json`. If a sub-tab is still working while Tab 1 reports `done`, ask Tab 1 to confirm sub-tab completion before closing out the item.
+1. Read `blocked` workspaces first with `hcmd peek <ws> --lines 60`. Forward non-trivial approvals or decisions to the user.
+2. Read `done` workspaces with `hcmd peek <ws> --lines 60`.
+3. Check `sub_tabs.any_working` and `sub_tabs.any_blocked` from `hcmd status --workspace <ws> --json`. If a sub-tab is still working while Tab 1 reports `done`, ask Tab 1 to confirm sub-tab completion before closing out the item.
 4. Record verified outcomes with `work-tracker note` or `work-tracker status` and update `daily/today-YYYY-MM-DD.md`.
 
 ## 5. Wrap up

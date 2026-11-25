@@ -8,11 +8,11 @@ from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import patch
 
-from herdr_spaces_status.cli import _dispatch, build_parser
-from herdr_spaces_status.formatters import OutputMode
-from herdr_spaces_status.herdr_client import ai_agent_select_backend
-from herdr_spaces_status.models import EXIT_CONFIG, CliError
-from herdr_spaces_status.orchestrate import (
+from herdr_commander.cli import _dispatch, build_parser
+from herdr_commander.formatters import OutputMode
+from herdr_commander.herdr_client import ai_agent_select_backend
+from herdr_commander.models import EXIT_CONFIG, CliError
+from herdr_commander.orchestrate import (
     LAUNCHERS,
     build_agent_start_args,
     build_pane_run_command,
@@ -23,7 +23,7 @@ from herdr_spaces_status.orchestrate import (
     sanitize_agent_name,
     validate_send,
 )
-from herdr_spaces_status.snapshot import parse_snapshot
+from herdr_commander.snapshot import parse_snapshot
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "snapshot_sample.json"
 
@@ -357,7 +357,7 @@ class CliWiringRegressionTests(unittest.TestCase):
             raise AssertionError(f"Unexpected subprocess call: {argv}")
 
         ns = build_parser().parse_args(["ensure", "--pr", "8539", "--launcher", "codex", "--json"])
-        with patch("herdr_spaces_status.herdr_client._run_subprocess", side_effect=fake_run):
+        with patch("herdr_commander.herdr_client._run_subprocess", side_effect=fake_run):
             raw_out = _dispatch(ns, FakeClient([snap0, snap1, snap2]), {}, "w4", self._JSON_MODE)
 
         self.assertEqual(
@@ -452,7 +452,7 @@ class CliWiringRegressionTests(unittest.TestCase):
                     "--json",
                 ]
             )
-            with patch("herdr_spaces_status.herdr_client._run_subprocess", side_effect=fake_run):
+            with patch("herdr_commander.herdr_client._run_subprocess", side_effect=fake_run):
                 raw_out = _dispatch(
                     ns,
                     FakeClient([snap0, snap1, snap2]),
@@ -550,8 +550,8 @@ class CliWiringRegressionTests(unittest.TestCase):
                 ["ensure", "--cwd", resolved_dir, "--launcher", "ay", "--json"]
             )
             with (
-                patch("herdr_spaces_status.herdr_client.shutil.which", return_value=None),
-                patch("herdr_spaces_status.herdr_client._run_subprocess", side_effect=fake_run),
+                patch("herdr_commander.herdr_client.shutil.which", return_value=None),
+                patch("herdr_commander.herdr_client._run_subprocess", side_effect=fake_run),
             ):
                 raw_out = _dispatch(
                     ns,
@@ -600,7 +600,7 @@ class CliWiringRegressionTests(unittest.TestCase):
         ns_wait = build_parser().parse_args(
             ["send", "w2", "--prompt", "Run checks", "--wait", "--timeout", "30", "--json"]
         )
-        with patch("herdr_spaces_status.herdr_client._run_subprocess", side_effect=fake_run):
+        with patch("herdr_commander.herdr_client._run_subprocess", side_effect=fake_run):
             out_nowait = _dispatch(
                 ns_nowait,
                 FakeClient([snap], detection_text=eligible_detection),
@@ -859,7 +859,7 @@ class _FakeProc:
 
 
 class AiAgentClientTests(unittest.TestCase):
-    _TARGET = "herdr_spaces_status.herdr_client.subprocess.run"
+    _TARGET = "herdr_commander.herdr_client.subprocess.run"
 
     def test_select_backend_parses_dry_run_json(self) -> None:
         payload = {"ok": True, "schema_version": 1, "data": {"selected": {"name": "ay"}}}

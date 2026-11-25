@@ -1,4 +1,4 @@
-"""Domain models, constants, and structured errors for herdr-spaces-status."""
+"""Domain models, constants, and structured errors for herdr-commander."""
 
 from __future__ import annotations
 

@@ -4,8 +4,8 @@ import json
 import unittest
 from pathlib import Path
 
-from herdr_spaces_status.models import CliError
-from herdr_spaces_status.snapshot import (
+from herdr_commander.models import CliError
+from herdr_commander.snapshot import (
     classify_claude_detection,
     correlate_work_tracker,
     filter_spaces,

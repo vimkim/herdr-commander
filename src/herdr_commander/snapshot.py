@@ -459,7 +459,7 @@ def resolve_target(spaces: Sequence[SpaceSnapshot], selector: str) -> SpaceSnaps
     raise CliError(
         "SPACE_NOT_FOUND",
         f"No workspace found matching {selector!r}.",
-        "Run `herdr-spaces-status status` to list active workspace IDs and labels.",
+        "Run `hcmd status` to list active workspace IDs and labels.",
     )
 
 
@@ -798,7 +798,7 @@ def resolve_tab_target(tabs: Sequence[WorkspaceTabInfo], selector: str) -> Works
     raise CliError(
         "TAB_NOT_FOUND",
         f"No tab found matching {selector!r}.",
-        "Run `hss tab list` to inspect tabs in this workspace.",
+        "Run `hcmd tab list` to inspect tabs in this workspace.",
     )
 
 
@@ -842,5 +842,5 @@ def resolve_pane_target(panes: Sequence[PaneInfo], selector: str) -> PaneInfo:
     raise CliError(
         "PANE_NOT_FOUND",
         f"No pane found matching {selector!r}.",
-        "Run `hss pane list` to inspect panes in this tab.",
+        "Run `hcmd pane list` to inspect panes in this tab.",
     )

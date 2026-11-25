@@ -1,4 +1,4 @@
-mod hss
+mod hcmd
 
 # Show available recipes.
 default:
@@ -10,7 +10,7 @@ alias install := sync
 sync:
     @test -d .git || { echo "Run just sync from the primary checkout, not a task worktree." >&2; exit 1; }
     @test "$(git branch --show-current)" = main || { echo "Run just sync from main." >&2; exit 1; }
-    just hss::install
+    just hcmd::install
     just install-skill
 
 # Symlink skill/herdr-commander for shared agents, Claude, Codex, and Antigravity (agy).

@@ -1,5 +1,5 @@
 [project]
-name = "herdr-spaces-status"
+name = "herdr-commander"
 version = "0.1.0"
 description = "First-tab workspace status, orchestration CLI, and commander skill for Herdr"
 readme = "README.md"
@@ -7,8 +7,9 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.scripts]
-herdr-spaces-status = "herdr_spaces_status.cli:main"
-hss = "herdr_spaces_status.cli:main"
+herdr-commander = "herdr_commander.cli:main"
+hcmd = "herdr_commander.cli:main"
+hss = "herdr_commander.cli:main"
 
 [dependency-groups]
 dev = ["ruff>=0.6"]

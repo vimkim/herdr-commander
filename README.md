@@ -1,6 +1,6 @@
-# herdr-spaces-status (`hss`)
+# herdr-commander (`hcmd`)
 
-First-tab-centric status inspection, idempotent orchestration, and commander skill for Herdr workspaces.
+First-tab-centric status inspection, idempotent orchestration, and commander skill for Herdr workspaces. (Legacy `hss` alias is kept for compatibility.)
 
 ## Install
 
@@ -10,7 +10,7 @@ Run from a clean `main` checkout:
 just sync
 ```
 
-This installs `herdr-spaces-status` and `hss` via `uv tool install --reinstall .` and symlinks `skill/herdr-commander` into `~/.agents/skills/herdr-commander`, `~/.claude/skills/herdr-commander` (Claude), `${CODEX_HOME:-~/.codex}/skills/herdr-commander` (Codex), and `~/.gemini/config/skills/herdr-commander` (Antigravity / `agy`).
+This installs `herdr-commander`, `hcmd`, and compatibility alias `hss` via `uv tool install --reinstall .` and symlinks `skill/herdr-commander` into `~/.agents/skills/herdr-commander`, `~/.claude/skills/herdr-commander` (Claude), `${CODEX_HOME:-~/.codex}/skills/herdr-commander` (Codex), and `~/.gemini/config/skills/herdr-commander` (Antigravity / `agy`).
 
 ## Commands
 
@@ -19,9 +19,9 @@ This installs `herdr-spaces-status` and `hss` via `uv tool install --reinstall .
 Inspect every workspace through its first tab (`tabs[0]` per workspace, regardless of tab ID or number) plus a rollup of all sub-tabs and split panes.
 
 ```bash
-hss status
-hss status --workers-only --verify-busy --with-tracker --json
-hss status --plain --fields number,workspace_id,attention,agent_kind,label
+hcmd status
+hcmd status --workers-only --verify-busy --with-tracker --json
+hcmd status --plain --fields number,workspace_id,attention,agent_kind,label
 ```
 
 - `--verify-busy` checks `agent.read(..., source="detection")` on `idle`/`done` Claude panes and marks background-active panes as `busy_bg` (counted under `working`).
@@ -32,8 +32,8 @@ hss status --plain --fields number,workspace_id,attention,agent_kind,label
 Read recent terminal output from a workspace's first-tab pane:
 
 ```bash
-hss peek w1 --lines 60
-hss peek CBRD-10001 --source visible --json
+hcmd peek w1 --lines 60
+hcmd peek CBRD-10001 --source visible --json
 ```
 
 ### `wait`
@@ -41,7 +41,7 @@ hss peek CBRD-10001 --source visible --json
 Subscribe to Herdr socket events until any watched first-tab reaches target states:
 
 ```bash
-hss wait --until blocked,done --timeout 300 --verify-busy --json
+hcmd wait --until blocked,done --timeout 300 --verify-busy --json
 ```
 
 ### `ensure`
@@ -49,8 +49,8 @@ hss wait --until blocked,done --timeout 300 --verify-busy --json
 Idempotently converge a workspace and its first-tab agent:
 
 ```bash
-hss ensure --ticket CBRD-10002 --launcher ai-agent --dry-run --json
-hss ensure --cwd ~/gh/my-repo --label my-repo --launcher ai-agent --json
+hcmd ensure --ticket CBRD-10002 --launcher ai-agent --dry-run --json
+hcmd ensure --cwd ~/gh/my-repo --label my-repo --launcher ai-agent --json
 ```
 
 | Launcher | Herdr agent kind | Notes |
@@ -72,7 +72,7 @@ hss ensure --cwd ~/gh/my-repo --label my-repo --launcher ai-agent --json
 Validate first-tab readiness and send a prompt (supports `--prompt -` from stdin):
 
 ```bash
-hss send w1 --prompt - --json <<'EOF'
+hcmd send w1 --prompt - --json <<'EOF'
 Summarize your findings in Tab 1.
 EOF
 ```
@@ -84,12 +84,12 @@ Refuses `blocked` agents (`AGENT_BLOCKED`), `working`/`busy_bg` agents without `
 Manage worker sub-tabs inside the caller's own Space (up to 8 sub-tabs by default, total 9 tabs matching `Alt+Shift+1..9`). Enforces Space Leader identity (`tabs[0]`, `panes[0]`, not `HERDR_TAB_ROLE=worker` or `HERDR_PANE_ROLE=worker`) and tags created tabs with `HERDR_TAB_ROLE=worker` to block recursive tab spawning.
 
 ```bash
-hss tab list --verify-busy
-hss tab spawn --label review --launcher ai-agent --prompt "Review current diff." --json
-hss tab wait --until blocked,done --verify-busy --json
-hss tab peek review --lines 60
-hss tab send review --prompt "Check edge cases." --json
-hss tab close review
+hcmd tab list --verify-busy
+hcmd tab spawn --label review --launcher ai-agent --prompt "Review current diff." --json
+hcmd tab wait --until blocked,done --verify-busy --json
+hcmd tab peek review --lines 60
+hcmd tab send review --prompt "Check edge cases." --json
+hcmd tab close review
 ```
 
 ### `pane` (Tab Leader)
@@ -97,21 +97,21 @@ hss tab close review
 Manage worker panes inside the caller's own tab (up to 3 worker panes by default, forming a 2×2 grid). Allowed for Space/Tab Leaders (`panes[0]`, not `HERDR_PANE_ROLE=worker`); tags split panes with `HERDR_PANE_ROLE=worker`.
 
 ```bash
-hss pane list --verify-busy
-hss pane spawn --launcher ai-agent --prompt "Audit tests." --json
-hss pane spawn --launcher shell --cmd "just test" --json
-hss pane wait --until blocked,done --verify-busy --json
-hss pane peek p2 --lines 60
-hss pane send p2 --prompt "Summarize failures." --json
-hss pane close p2
+hcmd pane list --verify-busy
+hcmd pane spawn --launcher ai-agent --prompt "Audit tests." --json
+hcmd pane spawn --launcher shell --cmd "just test" --json
+hcmd pane wait --until blocked,done --verify-busy --json
+hcmd pane peek p2 --lines 60
+hcmd pane send p2 --prompt "Summarize failures." --json
+hcmd pane close p2
 ```
 
-Default limits (override via CLI flags or environment variables; `0` = unlimited):
+Default limits (override via CLI flags or environment variables; legacy `HSS_MAX_*` fallbacks are also accepted; `0` = unlimited):
 
-- `HSS_MAX_SUB_TABS=8`: max non-primary sub-tabs per Space (`hss tab spawn --max-sub-tabs`).
-- `HSS_MAX_WORKER_PANES=3`: max non-primary worker panes per tab (`hss pane spawn --max-worker-panes`).
-- `HSS_MAX_SPACE_AGENTS=4`: max live non-primary AI agents per Space (`--max-space-agents`; `--launcher shell` bypasses).
-- `HSS_MAX_SESSION_AGENTS=10`: max currently working AI agents across the Herdr session (`--max-session-agents`; `--launcher shell` bypasses).
+- `HCMD_MAX_SUB_TABS=8`: max non-primary sub-tabs per Space (`hcmd tab spawn --max-sub-tabs`).
+- `HCMD_MAX_WORKER_PANES=3`: max non-primary worker panes per tab (`hcmd pane spawn --max-worker-panes`).
+- `HCMD_MAX_SPACE_AGENTS=4`: max live non-primary AI agents per Space (`--max-space-agents`; `--launcher shell` bypasses).
+- `HCMD_MAX_SESSION_AGENTS=10`: max currently working AI agents across the Herdr session (`--max-session-agents`; `--launcher shell` bypasses).
 
 ## JSON Contract and Exit Codes
 
@@ -143,4 +143,4 @@ just check
 just --choose
 ```
 
-Parameterless `hss` CLI lifecycle and query presets live in `hss.just` (`just --list hss` / `just hss <recipe>`).
+Parameterless `hcmd` CLI lifecycle and query presets live in `hcmd.just` (`just --list hcmd` / `just hcmd <recipe>`).

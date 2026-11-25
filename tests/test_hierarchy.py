@@ -7,10 +7,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from herdr_spaces_status.cli import _dispatch, build_parser
-from herdr_spaces_status.formatters import OutputMode
-from herdr_spaces_status.models import CliError
-from herdr_spaces_status.orchestrate import (
+from herdr_commander.cli import _dispatch, _resolve_cap, build_parser
+from herdr_commander.formatters import OutputMode
+from herdr_commander.models import CliError
+from herdr_commander.orchestrate import (
     choose_split_target,
     execute_pane_close,
     execute_pane_spawn,
@@ -20,7 +20,7 @@ from herdr_spaces_status.orchestrate import (
     plan_pane_spawn,
     plan_tab_spawn,
 )
-from herdr_spaces_status.snapshot import (
+from herdr_commander.snapshot import (
     count_session_working_agents,
     count_workspace_non_primary_agents,
     parse_workspace_tabs,
@@ -415,7 +415,7 @@ class HierarchyOrchestrateTests(unittest.TestCase):
             ns_tab = parser.parse_args(
                 ["tab", "spawn", "--label", "ci", "--launcher", "ai-agent", "--dry-run", "--json"]
             )
-            with patch("herdr_spaces_status.cli.ai_agent_select_backend", return_value="ai-round"):
+            with patch("herdr_commander.cli.ai_agent_select_backend", return_value="ai-round"):
                 tab_out = json.loads(_dispatch(ns_tab, client, env, "w1", mode))
             self.assertTrue(tab_out["data"]["dry_run"])
             self.assertEqual(tab_out["data"]["agent_kind"], "claude")
@@ -464,6 +464,16 @@ class HierarchyOrchestrateTests(unittest.TestCase):
             self.assertEqual(pane_res.pane_id, "w1:p9")
             self.assertEqual(split_calls[0][3], {"HERDR_PANE_ROLE": "worker"})
             self.assertEqual(run_calls, [("w1:p9", "just test")])
+
+    def test_cap_env_var_precedence_and_legacy_fallback(self) -> None:
+        vars_tuple = ("HCMD_MAX_SUB_TABS", "HSS_MAX_SUB_TABS")
+        self.assertEqual(_resolve_cap(None, {}, vars_tuple, 8), 8)
+        self.assertEqual(_resolve_cap(None, {"HSS_MAX_SUB_TABS": "5"}, vars_tuple, 8), 5)
+        self.assertEqual(
+            _resolve_cap(None, {"HCMD_MAX_SUB_TABS": "6", "HSS_MAX_SUB_TABS": "5"}, vars_tuple, 8),
+            6,
+        )
+        self.assertEqual(_resolve_cap(3, {"HCMD_MAX_SUB_TABS": "6"}, vars_tuple, 8), 3)
 
 
 if __name__ == "__main__":
