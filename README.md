@@ -18,6 +18,9 @@ Zero runtime dependencies (Python &ge;3.11 standard library) &middot; Strict `--
 
 ---
 
+<img width="1003" height="620" alt="image" src="https://github.com/user-attachments/assets/17a4e184-276a-4268-8780-95d98683e180" />
+
+
 ## Why This Exists
 
 Running multiple coding agents across Herdr workspaces breaks down fast when coordinators poll with `sleep`, guess which tab holds the workspace lead, or spawn unbounded nested agents. `herdr-commander` (`hcmd`) gives both humans and AI coordinators a deterministic control plane built around four invariants:
