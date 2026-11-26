@@ -13,7 +13,7 @@ Act strictly as the async-first coordinator in your own Herdr workspace. Execute
   - Blocking waits (`hcmd wait` / `hcmd send --wait`) are strictly **opt-in** when the user explicitly requests waiting in-session.
 - **`hcmd`-only inspection & reporting**: Inspect Space status, blockers, and results **strictly via `hcmd`** (`hcmd digest`, `hcmd status`, `hcmd peek [--tab/--pane]`, `hcmd find`, `hcmd ensure`, `hcmd send`).
   - **Forbidden bypasses**: Never call raw `herdr pane read` / `herdr agent read` / `herdr api snapshot`, never probe worker worktrees directly (`git -C`, `cat`, `rg`), and never execute task work inside the Commander session or bypass Herdr with in-process subagents or swarms.
-  - **Permitted coordination tools**: `work-tracker`, `daily-schedule` sheets, and `ai-agent --dry-run` (quota preflight).
+  - **Permitted coordination tools**: `work-tracker`, `daily-schedule` sheets, `cubrid-tcr` (read-only blocker/unblock lookups), and `ai-agent --dry-run` (quota preflight).
 - **4-tier hierarchy & hard caps**:
   - **Herdr Commander** (this session): dispatches and monitors Spaces asynchronously via `hcmd` (`hss` works as a compatibility alias).
   - **Space Lead** (`tabs[0]`, `panes[0]`): manages its own Space and may spawn up to **8 sub-tabs** (9 tabs total) via `hcmd tab spawn --label <role>` (`ai-agent` default; default guards of 4 live non-primary AI agents per Space and 10 working agents session-wide; `--launcher shell` unrestricted within the 8-tab cap).
@@ -160,6 +160,31 @@ Only run a blocking wait when the user **explicitly** asks you to wait in-sessio
 ```bash
 hcmd wait --until blocked,done --timeout 300 --verify-busy --json
 ```
+
+### Check CI-blocked waiting items (`cubrid-tcr` ↔ `work-tracker`)
+
+Keep a clean SSOT split: `work-tracker` owns waiting work items (`wait-for:<KEY>` tokens in notes), and `cubrid-tcr` owns fix merge readiness on `develop`. When checking whether waiting CUBRID tasks can wake up, run this 4-step reverse join:
+
+1. Find candidate waiting items:
+   ```bash
+   work-tracker search "wait-for:" --limit 100 --json
+   ```
+   Keep items with `status` in `("waiting", "blocked")`.
+2. Read recent history per matched item so stale tokens from earlier waits are ignored:
+   ```bash
+   work-tracker history <ID> --limit 10 --json
+   ```
+   Collect all `\bwait-for:([A-Za-z0-9._-]+)\b` keys from notes at or after the item's most recent transition into `waiting` or `blocked`.
+3. Query `cubrid-tcr` once for all collected keys (`--key` includes retired blockers so recently retired fixes are never missed):
+   ```bash
+   cubrid-tcr blockers --key <K1> --key <K2> --json
+   ```
+   Verify `schema_version == 1` and match each token against `blockers[].wait_keys`. Wake an item **only** when every one of its active wait keys has `readiness == "READY"`.
+4. Correlate each ready item's `workdir` to a live Herdr Space (or report it ready to launch if none exists):
+   ```bash
+   hcmd find --cwd <workdir> --json
+   ```
+   Include the blocker's `unblock_action` (`REBASE_ENGINE`, `RERUN_OR_SYNC_TC`, `REBASE_ENGINE_AND_SYNC_TC`) when waking or reporting to the user.
 
 ## 6. Wrap up
 
