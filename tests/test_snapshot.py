@@ -12,6 +12,7 @@ from herdr_commander.snapshot import (
     filter_spaces,
     find_matching_spaces,
     parse_snapshot,
+    resolve_peek_target,
     resolve_target,
     verify_claude_busy,
 )
@@ -59,6 +60,10 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(w1.sub_tabs.any_working)
         self.assertTrue(w1.sub_tabs.any_blocked)
         self.assertEqual(w1.sub_tabs.status_counts, {"working": 1, "blocked": 1})
+        self.assertEqual(
+            w1.sub_tabs.blocked_panes,
+            ({"tab_id": "w1:t4", "tab_label": "3 tc-pr-1234", "pane_id": "w1:p4"},),
+        )
 
         # Deleted workspace becomes unknown attention.
         w3 = by_id["w3"]
@@ -375,6 +380,40 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(CliError) as bad_pr_err:
             find_matching_spaces(spaces, pr_number="abc")
         self.assertEqual(bad_pr_err.exception.code, "INVALID_PR")
+
+    def test_resolve_peek_target_primary_tab_and_pane(self) -> None:
+        raw = load_fixture()
+        spaces = parse_snapshot(raw, self_workspace_id="w4", path_exists=lambda _p: True)
+
+        # Default resolves primary tab & primary pane.
+        space, tid, pane = resolve_peek_target(raw, spaces, "w1")
+        self.assertEqual((space.workspace_id, tid, pane.pane_id), ("w1", "w1:t1", "w1:p1"))
+
+        # --tab resolves by label or tab ID.
+        _, tid_tab, pane_tab = resolve_peek_target(raw, spaces, "w1", tab_selector="3 tc-pr-1234")
+        self.assertEqual((tid_tab, pane_tab.pane_id), ("w1:t4", "w1:p4"))
+
+        # --tab by 1-based position.
+        _, tid_pos, pane_pos = resolve_peek_target(raw, spaces, "w1", tab_selector="2")
+        self.assertEqual((tid_pos, pane_pos.pane_id), ("w1:t2", "w1:p2"))
+
+        # --pane across workspace tabs.
+        _, tid_p, pane_p = resolve_peek_target(raw, spaces, "w1", pane_selector="p4")
+        self.assertEqual((tid_p, pane_p.pane_id), ("w1:t4", "w1:p4"))
+
+        # --tab + --pane in multi-pane tab.
+        _, tid_sub, pane_sub = resolve_peek_target(
+            raw, spaces, "w2", tab_selector="t4", pane_selector="2"
+        )
+        self.assertEqual((tid_sub, pane_sub.pane_id), ("w2:t4", "w2:p5"))
+
+        with self.assertRaises(CliError) as missing_tab:
+            resolve_peek_target(raw, spaces, "w1", tab_selector="nope")
+        self.assertEqual(missing_tab.exception.code, "TAB_NOT_FOUND")
+
+        with self.assertRaises(CliError) as missing_pane:
+            resolve_peek_target(raw, spaces, "w1", pane_selector="p99")
+        self.assertEqual(missing_pane.exception.code, "PANE_NOT_FOUND")
 
 
 if __name__ == "__main__":

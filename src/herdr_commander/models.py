@@ -113,6 +113,7 @@ class SubTabRollup:
     status_counts: dict[str, int]
     any_blocked: bool
     any_working: bool
+    blocked_panes: tuple[dict[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -174,6 +175,62 @@ class PeekResult:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class DigestPeek:
+    """One terminal snippet attached to a workspace digest entry."""
+
+    tab_id: str
+    tab_label: str
+    pane_id: str
+    agent_kind: str | None
+    agent_status: str
+    is_primary: bool
+    lines: int
+    text: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class DigestEntry:
+    """One workspace included in an async `hcmd digest` report."""
+
+    space: SpaceSnapshot
+    needs_attention: bool
+    peeks: tuple[DigestPeek, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "needs_attention": self.needs_attention,
+            "workspace": self.space.to_dict(include_tabs=False),
+            "peeks": [peek.to_dict() for peek in self.peeks],
+        }
+
+
+@dataclass(frozen=True)
+class DigestResult:
+    """Non-blocking status summary and harvested output snippets across Spaces."""
+
+    total_workspaces: int
+    counts: dict[str, int]
+    sub_tabs_blocked_count: int
+    entries: tuple[DigestEntry, ...]
+    peek_lines: int
+    include_all: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total_workspaces": self.total_workspaces,
+            "count": len(self.entries),
+            "counts": self.counts,
+            "sub_tabs_blocked_count": self.sub_tabs_blocked_count,
+            "peek_lines": self.peek_lines,
+            "include_all": self.include_all,
+            "entries": [entry.to_dict() for entry in self.entries],
+        }
 
 
 @dataclass(frozen=True)

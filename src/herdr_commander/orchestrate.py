@@ -22,6 +22,9 @@ from .models import (
     VALID_SPLIT_DIRECTIONS,
     CallerContext,
     CliError,
+    DigestEntry,
+    DigestPeek,
+    DigestResult,
     EnsurePlan,
     EnsureResult,
     PaneCloseResult,
@@ -50,6 +53,7 @@ from .snapshot import (
     resolve_pane_target,
     resolve_tab_target,
     resolve_target,
+    strip_tab_decorations,
     verify_claude_busy,
     verify_panes_claude_busy,
 )
@@ -169,6 +173,30 @@ class ClosePaneFn(Protocol):
     """Callback matching `herdr_client.pane_close`."""
 
     def __call__(self, pane_id: str) -> None: ...
+
+
+class ReadPaneFn(Protocol):
+    """Callback matching `HerdrSocketClient.read_pane`."""
+
+    def __call__(
+        self,
+        pane_id: str,
+        *,
+        has_agent: bool,
+        source: str = "recent-unwrapped",
+        lines: int = 40,
+    ) -> dict[str, Any]: ...
+
+
+class TrustWorkspaceFn(Protocol):
+    """Callback matching `herdr_client.ensure_trusted_workspace`."""
+
+    def __call__(
+        self,
+        cwd: str,
+        agent_kinds: Sequence[str],
+        env: Mapping[str, str],
+    ) -> Sequence[str]: ...
 
 
 @dataclass(frozen=True)
@@ -607,6 +635,7 @@ def execute_ensure(
     start_agent: StartAgentFn,
     env: Mapping[str, str],
     select_backend: SelectBackendFn | None = None,
+    trust_workspace: TrustWorkspaceFn | None = None,
     self_workspace_id: str | None = None,
     dry_run: bool = False,
     ready_timeout: float = 45.0,
@@ -678,6 +707,10 @@ def execute_ensure(
             "Inspect the pane before launching another agent.",
             details={"workspace_id": target_space.workspace_id, "pane_id": pane.pane_id},
         )
+
+    launch_cwd = pane.cwd or str(created_meta.get("cwd") or plan.cwd or "")
+    if trust_workspace is not None and launch_cwd:
+        trust_workspace(launch_cwd, spec.expected_agents, env)
 
     if spec.mode == "agent_start":
         live_names = collect_live_agent_names(raw_snap)
@@ -845,7 +878,10 @@ def validate_send(space: SpaceSnapshot, *, prompt: str, force: bool) -> None:
         raise CliError(
             "AGENT_BUSY",
             (f"Agent in {space.label} ({pane.pane_id}) is currently {pane.effective_status}."),
-            "Wait for completion with `hcmd wait`, or pass --force.",
+            (
+                "Check progress with `hcmd status` / `hcmd digest` "
+                "(or `hcmd wait` if explicitly waiting), or pass --force."
+            ),
             details={"workspace_id": space.workspace_id, "pane_id": pane.pane_id},
         )
 
@@ -1054,7 +1090,10 @@ def _wait_for_pane_agent(
                 raise CliError(
                     "AGENT_STARTUP_BLOCKED",
                     f"Launched agent {pane.agent_kind} is blocked at startup in {pane.pane_id}.",
-                    f"Inspect it with `herdr pane read {pane.pane_id} --lines 40`.",
+                    (
+                        "Inspect it with `hcmd tab peek` / `hcmd pane peek` "
+                        f"(or `hcmd peek {workspace_id} --pane {pane.pane_id}`)."
+                    ),
                     details={"workspace_id": workspace_id, "pane_id": pane.pane_id},
                 )
             if pane.interactive_ready or pane.raw_status in {"idle", "done"}:
@@ -1311,6 +1350,7 @@ def execute_tab_spawn(
     prompt_fn: PromptAgentFn,
     env: Mapping[str, str],
     select_backend: SelectBackendFn | None = None,
+    trust_workspace: TrustWorkspaceFn | None = None,
     dry_run: bool = False,
     ready_timeout: float = 45.0,
     poll_interval: float = 0.5,
@@ -1360,6 +1400,9 @@ def execute_tab_spawn(
             agent_name=None,
             prompt_sent=False,
         )
+
+    if trust_workspace is not None:
+        trust_workspace(plan.cwd, spec.expected_agents, env)
 
     pane = _launch_agent_in_pane(
         spec=spec,
@@ -1675,6 +1718,7 @@ def execute_pane_spawn(
     prompt_fn: PromptAgentFn,
     env: Mapping[str, str],
     select_backend: SelectBackendFn | None = None,
+    trust_workspace: TrustWorkspaceFn | None = None,
     dry_run: bool = False,
     ready_timeout: float = 45.0,
     poll_interval: float = 0.5,
@@ -1729,6 +1773,9 @@ def execute_pane_spawn(
             shell_cmd=plan.shell_cmd,
             prompt_sent=False,
         )
+
+    if trust_workspace is not None:
+        trust_workspace(plan.cwd, spec.expected_agents, env)
 
     pane = _launch_agent_in_pane(
         spec=spec,
@@ -1900,6 +1947,103 @@ def execute_pane_close(
         workspace_id=caller.workspace_id,
         tab_id=caller.tab_id,
         pane_id=pane.pane_id,
+    )
+
+
+def execute_digest(
+    spaces: Sequence[SpaceSnapshot],
+    *,
+    read_pane: ReadPaneFn,
+    include_all: bool = False,
+    workspace: str | None = None,
+    peek_lines: int = 40,
+    peek_source: str = "recent-unwrapped",
+) -> tuple[DigestResult, list[str]]:
+    """Build a non-blocking status digest and harvest attention/target pane snippets."""
+    counts: dict[str, int] = {}
+    sub_tabs_blocked_count = 0
+    for space in spaces:
+        counts[space.attention] = counts.get(space.attention, 0) + 1
+        if space.sub_tabs.any_blocked:
+            sub_tabs_blocked_count += 1
+
+    entries: list[DigestEntry] = []
+    warnings: list[str] = []
+    for space in spaces:
+        needs_attention = space.attention in {"blocked", "done"} or space.sub_tabs.any_blocked
+        if not include_all and workspace is None and not needs_attention:
+            continue
+
+        peeks: list[DigestPeek] = []
+        if peek_lines > 0:
+            pane = space.primary_pane
+            if pane is not None and (
+                space.attention in {"blocked", "done"} or workspace is not None
+            ):
+                try:
+                    read = read_pane(
+                        pane.pane_id,
+                        has_agent=pane.agent_kind is not None,
+                        source=peek_source,
+                        lines=peek_lines,
+                    )
+                    peeks.append(
+                        DigestPeek(
+                            tab_id=space.primary_tab_id or "",
+                            tab_label=strip_tab_decorations(space.primary_tab_label or "Tab 1"),
+                            pane_id=pane.pane_id,
+                            agent_kind=pane.agent_kind,
+                            agent_status=pane.effective_status,
+                            is_primary=True,
+                            lines=peek_lines,
+                            text=str(read["text"]),
+                        )
+                    )
+                except CliError as exc:
+                    warnings.append(f"{space.workspace_id} ({pane.pane_id}): {exc.message}")
+
+            for bp in space.sub_tabs.blocked_panes:
+                bp_pane_id = bp["pane_id"]
+                try:
+                    read = read_pane(
+                        bp_pane_id,
+                        has_agent=True,
+                        source=peek_source,
+                        lines=peek_lines,
+                    )
+                    peeks.append(
+                        DigestPeek(
+                            tab_id=bp["tab_id"],
+                            tab_label=bp["tab_label"],
+                            pane_id=bp_pane_id,
+                            agent_kind=None,
+                            agent_status="blocked",
+                            is_primary=False,
+                            lines=peek_lines,
+                            text=str(read["text"]),
+                        )
+                    )
+                except CliError as exc:
+                    warnings.append(f"{space.workspace_id} ({bp_pane_id}): {exc.message}")
+
+        entries.append(
+            DigestEntry(
+                space=space,
+                needs_attention=needs_attention,
+                peeks=tuple(peeks),
+            )
+        )
+
+    return (
+        DigestResult(
+            total_workspaces=len(spaces),
+            counts=counts,
+            sub_tabs_blocked_count=sub_tabs_blocked_count,
+            entries=tuple(entries),
+            peek_lines=peek_lines,
+            include_all=include_all,
+        ),
+        warnings,
     )
 
 

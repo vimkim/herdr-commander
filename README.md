@@ -26,7 +26,7 @@ Zero runtime dependencies (Python &ge;3.11 standard library) &middot; Strict `--
 Running multiple coding agents across Herdr workspaces breaks down fast when coordinators poll with `sleep`, guess which tab holds the workspace lead, or spawn unbounded nested agents. `herdr-commander` (`hcmd`) gives both humans and AI coordinators a deterministic control plane built around four invariants:
 
 1. **4-tier Herdr hierarchy with role enforcement**:
-   - **Herdr Commander (`hcmd`)** coordinates across Spaces (`status`, `find`, `ensure`, `send`, `wait`, `peek`).
+   - **Herdr Commander (`hcmd`)** coordinates asynchronously across Spaces (`digest`, `status`, `find`, `ensure`, `send`, `peek`, and opt-in `wait`).
    - **Space Leads (`tabs[0]`, `panes[0]`)** manage up to 8 sub-tabs (`Alt+Shift+1..9`) via `hcmd tab` and tag spawned sub-tabs with `HERDR_TAB_ROLE=worker`.
    - **Tab Leads (`tabs[1..8]`, `panes[0]`)** manage up to 3 worker panes (`2×2` grid) inside their own tab via `hcmd pane`, tag split panes with `HERDR_PANE_ROLE=worker`, and never create tabs.
    - **Pane Workers (`panes[1..3]`)** execute assigned work only; recursive tab and pane spawning is blocked.
@@ -55,14 +55,28 @@ All subcommands accept common output and socket flags: `--json`, `--plain`, `--n
 
 | Command | Tier | Purpose |
 | --- | --- | --- |
+| `hcmd digest` | Commander | Non-blocking summary + `peek` snippets for `blocked`/`done`/blocked-subtab Spaces |
 | `hcmd status` | Commander | Inspect every Space via `tabs[0]` plus sub-tab/pane rollups |
 | `hcmd find` | Commander | Pre-launch lookup by name, label, `cwd`/`pwd`, ticket, or PR |
-| `hcmd peek` | Commander | Read recent terminal output from a Space's first-tab pane |
-| `hcmd wait` | Commander | Subscribe to Herdr socket events until watched first-tabs match `--until` |
+| `hcmd peek` | Commander | Read recent terminal output from a Space pane (default: first-tab pane) |
 | `hcmd ensure` | Commander | Idempotently create or reuse a workspace and start its first-tab agent |
 | `hcmd send` | Commander | Validate readiness and dispatch a prompt (inline or `--prompt -` stdin) |
+| `hcmd wait` | Commander (opt-in) | Blocking wait on Herdr socket events until watched first-tabs match `--until` |
 | `hcmd tab` | Space Lead | `list`, `spawn`, `peek`, `send`, `wait`, `close` sub-tabs in own Space |
 | `hcmd pane` | Tab / Space Lead | `list`, `spawn`, `peek`, `send`, `wait`, `close` worker panes in own tab |
+
+### `digest`
+
+Non-blocking Commander check-in command. Defaults to `--workers-only`, `--verify-busy`, and `--with-tracker`, summarizing worker counts and automatically peeking `blocked`, `done`, and `sub_tabs.any_blocked` panes in one call:
+
+```bash
+hcmd digest
+hcmd digest --json
+hcmd digest --all --peek-lines 0
+hcmd digest --workspace CBRD-10001 --peek-lines 60
+```
+
+- `--all` includes `working`/`idle`/`shell` Spaces in addition to attention-needed ones; `--workspace` digests a single Space; `--include-self` includes the caller's Space; `--no-verify-busy` / `--no-tracker` disable extra checks; `--peek-lines 0` skips terminal reads.
 
 ### `status`
 
@@ -98,18 +112,20 @@ hcmd find demo-lead --json
 
 ### `peek`
 
-Read recent terminal output from a workspace's first-tab pane:
+Read recent terminal output from a workspace pane (default: first-tab pane):
 
 ```bash
 hcmd peek w1 --lines 60
+hcmd peek w1 --tab review --lines 60
+hcmd peek w1 --pane p2 --verify-busy
 hcmd peek CBRD-10001 --source visible --json
 ```
 
-- Supports `--lines` (default `40`) and `--source` (`recent-unwrapped` default, `visible`, `recent`, `detection`).
+- Supports `--tab` (tab ID, 1-based tab index, or role label), `--pane` (pane ID, 1-based index, or agent name), `--verify-busy`, `--lines` (default `40`), and `--source` (`recent-unwrapped` default, `visible`, `recent`, `detection`).
 
-### `wait`
+### `wait` (opt-in)
 
-Subscribe to Herdr socket events until any watched first-tab reaches target states:
+Opt-in blocking wait on Herdr socket events until any watched first-tab reaches target states (Commander dispatches asynchronously by default and harvests via `hcmd digest`):
 
 ```bash
 hcmd wait --until blocked,done --timeout 300 --verify-busy --json
@@ -143,11 +159,12 @@ hcmd ensure --cwd ~/gh/my-repo --pwd ~/gh/my-repo --label my-repo --on-existing 
   - `new` (or shorthand `--new`): creates a fresh `--cwd`/`--pwd` workspace even when a matching workspace exists.
 - `--reuse <target>` explicitly targets an existing workspace ID, label, or ticket to ensure/launch its first-tab agent.
 - Delegates `--ticket` and `--pr` (with optional `--base`) workspace creation to `cubrid-worktree` and `--cwd` creation to `herdr-next-to-current` or `herdr workspace create --no-focus`, waiting up to `--ready-timeout` seconds (default `45`).
+- Automatically pre-trusts the target directory in Claude (`~/.claude.json`), Codex (`~/.codex/local.config.toml`), and Antigravity (`~/.gemini/antigravity-cli/settings.json`) configs before launching an AI agent (`--no-trust` to skip; also enabled on `hcmd tab spawn` and `hcmd pane spawn`).
 - Refuses to overwrite a first-tab pane already occupied by a different agent kind (`OCCUPIED_BY_OTHER_AGENT`).
 
 ### `send`
 
-Validate first-tab readiness and send a prompt (supports `--prompt -` from stdin, `--wait` with `--timeout` default `120`, and `--dry-run`):
+Validate first-tab readiness and send a prompt (supports `--prompt -` from stdin, opt-in `--wait` with `--timeout` default `120`, and `--dry-run`; default is async fire-and-return):
 
 ```bash
 hcmd send w1 --prompt - --json <<'EOF'

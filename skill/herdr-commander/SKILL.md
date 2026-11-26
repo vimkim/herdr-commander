@@ -1,20 +1,26 @@
 ---
 name: herdr-commander
-description: Coordinate all tasks through Herdr workspaces and Herdr tabs by managing each workspace's first-tab agent. Use when acting as a Herdr commander to plan or dispatch work into Herdr workspaces, launch ai-agent, ay, ai-round, or ai-best in matching worktrees or directories, monitor first-tab progress, or harvest completed workspace results.
+description: Coordinate all tasks asynchronously through Herdr workspaces and Herdr tabs using hcmd only. Dispatch Space Leads with hcmd ensure/send and return control immediately; harvest status, blockers, and reports strictly through hcmd digest/status/peek.
 ---
 
 # Herdr Commander
 
-Act strictly as the coordinator in your own Herdr workspace. Execute **all** work through Herdr workspaces and Herdr tabs:
+Act strictly as the async-first coordinator in your own Herdr workspace. Execute **all** work through Herdr workspaces and Herdr tabs, and inspect/harvest **strictly via `hcmd`**:
 
-- **All tasks run in Herdr workspaces + tabs**: Dispatch every piece of task work — implementation, debugging, investigation, code review, builds, tests, docs, or PR/CI work — into a Herdr workspace (Tab 1 via `hcmd ensure` and `hcmd send`) and its Herdr tabs. Never perform task work directly in the commander session or bypass Herdr with in-process subagents or swarms.
-- **Commander session scope**: Keep this session strictly on coordination — reconciling schedules and trackers, checking status, ensuring workspaces, sending briefs, waiting on events, peeking output, updating `work-tracker` / daily sheets, and reporting to the user.
+- **All tasks run asynchronously in Herdr Spaces**: Dispatch every piece of task work — implementation, debugging, investigation, code review, builds, tests, docs, or PR/CI work — into a Herdr Space (Tab 1 via `hcmd ensure` and `hcmd send`). Once dispatched, record the workspace ID in `work-tracker`, report the live Herdr location, and **return control immediately**.
+  - Do **not** run `hcmd wait` or `hcmd send --wait` by default after dispatching.
+  - Do **not** ask *"should I wait here?"* — background async execution is the default.
+  - Blocking waits (`hcmd wait` / `hcmd send --wait`) are strictly **opt-in** when the user explicitly requests waiting in-session.
+- **`hcmd`-only inspection & reporting**: Inspect Space status, blockers, and results **strictly via `hcmd`** (`hcmd digest`, `hcmd status`, `hcmd peek [--tab/--pane]`, `hcmd find`, `hcmd ensure`, `hcmd send`).
+  - **Forbidden bypasses**: Never call raw `herdr pane read` / `herdr agent read` / `herdr api snapshot`, never probe worker worktrees directly (`git -C`, `cat`, `rg`), and never execute task work inside the Commander session or bypass Herdr with in-process subagents or swarms.
+  - **Permitted coordination tools**: `work-tracker`, `daily-schedule` sheets, and `ai-agent --dry-run` (quota preflight).
 - **4-tier hierarchy & hard caps**:
-  - **Herdr Commander** (this session): manages Spaces via `hcmd status` / `find` / `ensure` / `send` / `wait` / `peek` (`hss` works as a compatibility alias).
+  - **Herdr Commander** (this session): dispatches and monitors Spaces asynchronously via `hcmd` (`hss` works as a compatibility alias).
   - **Space Lead** (`tabs[0]`, `panes[0]`): manages its own Space and may spawn up to **8 sub-tabs** (9 tabs total) via `hcmd tab spawn --label <role>` (`ai-agent` default; default guards of 4 live non-primary AI agents per Space and 10 working agents session-wide; `--launcher shell` unrestricted within the 8-tab cap).
   - **Tab Lead** (`tabs[1..8]`, `panes[0]`): may split up to **3 worker panes** (2×2 grid) inside its own tab via `hcmd pane spawn`; never creates new tabs.
   - **Pane Worker** (`panes[1..]`): executes assigned work; never creates tabs or splits panes.
-- **Context-size management**: Simple, quick checks can be handled directly, but **Herdr Commander, Space Leads, and Tab Leads should prefer delegating substantial, exploratory, noisy, or multi-step work** to Herdr workspaces/tabs (`hcmd tab`), worker panes (`hcmd pane`), or in-process subagents (within Space/Tab Leads) so each lead keeps its context window compact and focused on orchestration and synthesis.
+- **Automatic workspace pre-trust**: `hcmd ensure`, `hcmd tab spawn`, and `hcmd pane spawn` automatically pre-trust the target directory in Claude, Codex, and Antigravity (`agy`) local configs before launching an AI agent (`--no-trust` to opt out).
+- **Context-size management**: Keep this Commander session strictly on coordination — reconciling schedules and trackers, checking status, ensuring workspaces, sending briefs, harvesting reports via `hcmd digest` / `hcmd peek`, updating `work-tracker` / daily sheets, and reporting to the user. **Herdr Commander, Space Leads, and Tab Leads should prefer delegating substantial, exploratory, noisy, or multi-step work** to Herdr workspaces/tabs (`hcmd tab`), worker panes (`hcmd pane`), or in-process subagents (within Space/Tab Leads) so each lead keeps its context window compact and focused on orchestration and synthesis.
 
 Delegate sibling concerns to existing skills rather than duplicating their rules.
 
@@ -110,35 +116,50 @@ hcmd ensure --cwd ~/gh/my-project --label my-project-2 --on-existing new --launc
 
 If `ensure` exits with `OCCUPIED_BY_OTHER_AGENT`, inspect the workspace with `hcmd peek <ws>` instead of overwriting the pane.
 
-Send the kickoff brief to Tab 1 via stdin so multiline text needs no shell escaping:
+Send the kickoff brief to Tab 1 via stdin so multiline text needs no shell escaping (never pass `--wait` unless the user explicitly requested blocking):
 
 ```bash
 hcmd send <ws> --prompt - --json <<'EOF'
 Objective: <concise goal and acceptance criteria>.
 Tracker ID: <work-tracker ID or none>.
 Workspace execution: Use `hcmd tab` inside this workspace for parallel work, builds, tests, or helper agents (up to 8 sub-tabs, short role `--label` such as build, test, review, or ci, `ai-agent` default for AI workers, `--launcher shell` for commands). Keep your own context window lean by delegating substantial, noisy, or exploratory work to sub-tabs or subagents while handling trivial steps directly. Keep same-worktree edits to one agent at a time, and close finished sub-tabs you created with `hcmd tab close`.
-Reporting rule: Keep final findings, verification evidence (commits, test runs, PR or doc paths), and blockers summarized in this first tab.
+Reporting rule: Keep final findings, verification evidence, and blockers in this first tab. End your final or blocked Tab 1 response with a compact block so Commander can harvest it via `hcmd digest` / `hcmd peek`:
+- Status: <done | blocked>
+- Summary: <1-3 concise bullets>
+- Evidence: <commits, test runs, PR/doc paths>
+- Blockers / Next: <approval/decision needed or none>
 EOF
 ```
 
 Never pass `--force` to bypass `AGENT_BLOCKED`. Inspect blocked dialogs with `hcmd peek <ws>` and ask the user before answering approval or question prompts.
 
-Completion criterion. Every assigned task shows a ready or working agent in Tab 1, and `work-tracker` notes record the workspace ID.
+Completion criterion. Every assigned task shows a ready or working agent in Tab 1, `work-tracker` notes record the workspace ID, and **Commander returns control immediately without blocking on `hcmd wait`**.
 
-## 5. Monitor events and harvest outcomes
+## 5. Check status and harvest reports (async on-demand)
 
-Wait on Herdr socket events instead of sleeping in a polling loop:
+When the user asks for an update, or when reconciling active workspaces, gather status and output snippets in a single non-blocking `hcmd` call:
+
+```bash
+hcmd digest --json
+```
+
+`hcmd digest` defaults to `--workers-only`, `--verify-busy`, and `--with-tracker`, summarizing all worker Spaces and peeking `blocked`, `done`, and blocked sub-tab panes in one shot. Use `hcmd status --workers-only --verify-busy --with-tracker --json` for a table-only check, or `hcmd peek <ws> --lines 60` for deeper Tab 1 context.
+
+Handle attention workspaces in priority order:
+
+1. Read `blocked` workspaces first (included in `hcmd digest`; use `hcmd peek <ws> --lines 60` if more context is needed). Forward non-trivial approvals or decisions to the user.
+2. When `sub_tabs.any_blocked` is true, read the blocked sub-tab directly via `hcmd peek <ws> --tab <tab_id_or_label> --lines 60` (or rely on the blocked sub-tab snippet in `hcmd digest`) before escalating to the user.
+3. Read `done` workspaces via `hcmd digest` / `hcmd peek <ws> --lines 60`.
+4. Check `sub_tabs.any_working` and `sub_tabs.any_blocked`. If a sub-tab is still working while Tab 1 reports `done`, ask Tab 1 to confirm sub-tab completion before closing out the item.
+5. Record verified outcomes with `work-tracker note` or `work-tracker status` and update `daily/today-YYYY-MM-DD.md`.
+
+### Explicit wait (opt-in only)
+
+Only run a blocking wait when the user **explicitly** asks you to wait in-session for completion or blockers:
 
 ```bash
 hcmd wait --until blocked,done --timeout 300 --verify-busy --json
 ```
-
-Handle woken workspaces in priority order.
-
-1. Read `blocked` workspaces first with `hcmd peek <ws> --lines 60`. Forward non-trivial approvals or decisions to the user.
-2. Read `done` workspaces with `hcmd peek <ws> --lines 60`.
-3. Check `sub_tabs.any_working` and `sub_tabs.any_blocked` from `hcmd status --workspace <ws> --json`. If a sub-tab is still working while Tab 1 reports `done`, ask Tab 1 to confirm sub-tab completion before closing out the item.
-4. Record verified outcomes with `work-tracker note` or `work-tracker status` and update `daily/today-YYYY-MM-DD.md`.
 
 ## 6. Wrap up
 

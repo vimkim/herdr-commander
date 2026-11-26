@@ -545,6 +545,115 @@ class CliContractTests(unittest.TestCase):
                 self.assertEqual(new_data["workspace_action"], "create_cwd")
                 self.assertEqual(new_data["label"], "demo-skills-2")
 
+    def test_digest_and_peek_tab_via_socket(self) -> None:
+        snapshot = copy.deepcopy(json.loads(FIXTURE_PATH.read_text(encoding="utf-8")))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            live_dir = Path(tmpdir) / "live-repo"
+            live_dir.mkdir()
+            for item in (*snapshot["panes"], *snapshot["agents"]):
+                if item["workspace_id"] != "w3":
+                    item["cwd"] = str(live_dir)
+                    if "foreground_cwd" in item:
+                        item["foreground_cwd"] = str(live_dir)
+            sock_path = Path(tmpdir) / "herdr.sock"
+            with MockHerdrServer(sock_path, snapshot):
+                digest_json = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "digest",
+                        "--no-tracker",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(digest_json.returncode, 0, digest_json.stderr)
+                data = json.loads(digest_json.stdout)["data"]
+                self.assertEqual(data["total_workspaces"], 5)
+                self.assertEqual(data["count"], 1)
+                self.assertEqual(data["sub_tabs_blocked_count"], 1)
+                entry = data["entries"][0]
+                self.assertEqual(entry["workspace"]["workspace_id"], "w1")
+                self.assertTrue(entry["needs_attention"])
+                self.assertEqual([p["pane_id"] for p in entry["peeks"]], ["w1:p1", "w1:p4"])
+
+                digest_plain = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "digest",
+                        "--no-tracker",
+                        "--peek-lines",
+                        "0",
+                        "--plain",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(digest_plain.returncode, 0, digest_plain.stderr)
+                self.assertIn(
+                    "w1\tdone\tagy\t+2t/2p(1!,1w)\tCBRD-10001\t-\tCBRD-10001-demo\t0",
+                    digest_plain.stdout,
+                )
+
+                digest_human = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "digest",
+                        "--no-tracker",
+                        "--no-color",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(digest_human.returncode, 0, digest_human.stderr)
+                self.assertIn("Workers: 5", digest_human.stdout)
+                self.assertIn("sub_tabs_blocked=1", digest_human.stdout)
+                self.assertIn("[blocked sub-tab 3 tc-pr-1234 (w1:t4/w1:p4)]", digest_human.stdout)
+
+                peek_tab = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "peek",
+                        "w1",
+                        "--tab",
+                        "3 tc-pr-1234",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(peek_tab.returncode, 0, peek_tab.stderr)
+                peek_data = json.loads(peek_tab.stdout)["data"]
+                self.assertEqual(peek_data["tab_id"], "w1:t4")
+                self.assertEqual(peek_data["pane_id"], "w1:p4")
+                self.assertEqual(peek_data["agent_status"], "blocked")
+
+                peek_busy = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "peek",
+                        "w6",
+                        "--verify-busy",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(peek_busy.returncode, 0, peek_busy.stderr)
+                self.assertEqual(json.loads(peek_busy.stdout)["data"]["agent_status"], "busy_bg")
+
+    def test_no_trust_flag_parses_on_ensure_tab_and_pane(self) -> None:
+        from herdr_commander.cli import build_parser
+
+        parser = build_parser()
+        ns_ensure = parser.parse_args(["ensure", "--ticket", "CBRD-10001", "--no-trust"])
+        ns_tab = parser.parse_args(["tab", "spawn", "--label", "ci", "--no-trust"])
+        ns_pane = parser.parse_args(["pane", "spawn", "--no-trust"])
+        self.assertFalse(ns_ensure.auto_trust)
+        self.assertFalse(ns_tab.auto_trust)
+        self.assertFalse(ns_pane.auto_trust)
+        self.assertTrue(parser.parse_args(["ensure", "--ticket", "CBRD-10001"]).auto_trust)
+
 
 if __name__ == "__main__":
     unittest.main()

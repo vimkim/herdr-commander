@@ -16,6 +16,7 @@ from herdr_commander.orchestrate import (
     LAUNCHERS,
     build_agent_start_args,
     build_pane_run_command,
+    execute_digest,
     execute_ensure,
     execute_send,
     plan_ensure,
@@ -1132,6 +1133,161 @@ class AiAgentClientTests(unittest.TestCase):
         self.assertEqual(data["launcher"], "ai-agent")
         self.assertEqual(data["agent_action"], "launch")
         self.assertEqual(data["agent_kind"], "claude")
+
+
+class DigestAndTrustOrchestrateTests(unittest.TestCase):
+    def test_execute_digest_filters_attention_and_peeks_blocked_subtabs(self) -> None:
+        raw = load_fixture()
+        spaces = [
+            s
+            for s in parse_snapshot(raw, self_workspace_id="w4", path_exists=lambda _p: True)
+            if not s.is_self
+        ]
+        reads: list[tuple[str, bool, str, int]] = []
+
+        def fake_read(
+            pane_id: str,
+            *,
+            has_agent: bool,
+            source: str = "recent-unwrapped",
+            lines: int = 40,
+        ) -> dict:
+            reads.append((pane_id, has_agent, source, lines))
+            if pane_id == "w3:p1":
+                raise CliError("HERDR_API_ERROR", "pane gone", "check status")
+            return {"pane_id": pane_id, "text": f"output:{pane_id}"}
+
+        result, warnings = execute_digest(spaces, read_pane=fake_read, peek_lines=25)
+        self.assertEqual(warnings, [])
+        self.assertEqual(result.total_workspaces, 5)
+        self.assertEqual(result.sub_tabs_blocked_count, 1)
+        # Only w1 (primary done + sub-tab w1:t4 blocked) needs attention.
+        self.assertEqual([e.space.workspace_id for e in result.entries], ["w1"])
+        self.assertEqual([p.pane_id for p in result.entries[0].peeks], ["w1:p1", "w1:p4"])
+        self.assertEqual(
+            reads,
+            [
+                ("w1:p1", True, "recent-unwrapped", 25),
+                ("w1:p4", True, "recent-unwrapped", 25),
+            ],
+        )
+
+        # --all with --peek-lines 0 returns all spaces without reading panes.
+        all_result, all_warnings = execute_digest(
+            spaces, read_pane=fake_read, include_all=True, peek_lines=0
+        )
+        self.assertEqual(all_warnings, [])
+        self.assertEqual(len(all_result.entries), 5)
+        self.assertTrue(all(not e.peeks for e in all_result.entries))
+
+        # Single-workspace digest surfaces graceful read_pane warning on error.
+        w3_result, w3_warnings = execute_digest(
+            [s for s in spaces if s.workspace_id == "w3"],
+            read_pane=fake_read,
+            workspace="w3",
+            peek_lines=10,
+        )
+        self.assertEqual(len(w3_result.entries), 1)
+        self.assertEqual(w3_warnings, ["w3 (w3:p1): pane gone"])
+
+    def test_execute_ensure_calls_trust_only_on_real_agent_launch(self) -> None:
+        raw = load_fixture()
+        spaces = parse_snapshot(raw, self_workspace_id="w4", path_exists=lambda _p: True)
+        trust_calls: list[tuple[str, tuple[str, ...]]] = []
+
+        def fake_trust(cwd: str, kinds: Sequence[str], _env: dict[str, str]) -> list[str]:
+            trust_calls.append((cwd, tuple(kinds)))
+            return []
+
+        # Dry run does not trust.
+        plan_new = plan_ensure(
+            spaces,
+            label=None,
+            cwd=None,
+            ticket="CBRD-10002",
+            pr_number=None,
+            launcher_name="ai-agent",
+        )
+        execute_ensure(
+            plan_new,
+            client=FakeClient([raw]),
+            env={},
+            select_backend=lambda: "ay",
+            trust_workspace=fake_trust,
+            dry_run=True,
+            create_cwd=lambda _l, _c: {},
+            create_ticket=lambda _t, base=None: {},
+            create_pr=lambda _p: {},
+            run_pane=lambda _p, _c: None,
+            start_agent=lambda _n, _k, _p, _a, timeout_ms=45000: {},
+        )
+        self.assertEqual(trust_calls, [])
+
+        # Shell launcher does not trust.
+        plan_shell = plan_ensure(
+            spaces,
+            label=None,
+            cwd=None,
+            ticket="CBRD-10002",
+            pr_number=None,
+            launcher_name="shell",
+        )
+        execute_ensure(
+            plan_shell,
+            client=FakeClient([raw]),
+            env={},
+            trust_workspace=fake_trust,
+            create_cwd=lambda _l, _c: {},
+            create_ticket=lambda _t, base=None: {},
+            create_pr=lambda _p: {},
+            run_pane=lambda _p, _c: None,
+            start_agent=lambda _n, _k, _p, _a, timeout_ms=45000: {},
+        )
+        self.assertEqual(trust_calls, [])
+
+        # Reuse does not trust.
+        plan_reuse = plan_ensure(
+            spaces,
+            label=None,
+            cwd=None,
+            ticket="CBRD-10003",
+            pr_number=None,
+            launcher_name="ai-agent",
+        )
+        execute_ensure(
+            plan_reuse,
+            client=FakeClient([raw]),
+            env={},
+            trust_workspace=fake_trust,
+            create_cwd=lambda _l, _c: {},
+            create_ticket=lambda _t, base=None: {},
+            create_pr=lambda _p: {},
+            run_pane=lambda _p, _c: None,
+            start_agent=lambda _n, _k, _p, _a, timeout_ms=45000: {},
+        )
+        self.assertEqual(trust_calls, [])
+
+        # Real codex agent_start launch triggers trust for ("codex",).
+        plan_codex = plan_ensure(
+            spaces,
+            label=None,
+            cwd=None,
+            ticket="CBRD-10002",
+            pr_number=None,
+            launcher_name="codex",
+        )
+        execute_ensure(
+            plan_codex,
+            client=FakeClient([raw, raw]),
+            env={},
+            trust_workspace=fake_trust,
+            create_cwd=lambda _l, _c: {},
+            create_ticket=lambda _t, base=None: {},
+            create_pr=lambda _p: {},
+            run_pane=lambda _p, _c: None,
+            start_agent=lambda _n, _k, _p, _a, timeout_ms=45000: {},
+        )
+        self.assertEqual(trust_calls, [("/home/user/gh/cb/CBRD-10002", ("codex",))])
 
 
 if __name__ == "__main__":

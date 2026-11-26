@@ -12,6 +12,7 @@ from . import __version__
 from .formatters import (
     STATUS_FIELDS,
     OutputMode,
+    format_digest,
     format_ensure,
     format_error,
     format_find,
@@ -38,6 +39,7 @@ from .herdr_client import (
     create_workspace_cubrid_pr,
     create_workspace_cubrid_ticket,
     create_workspace_cwd,
+    ensure_trusted_workspace,
     fetch_work_tracker_items,
     pane_close,
     pane_run,
@@ -67,6 +69,8 @@ from .models import (
 )
 from .orchestrate import (
     LAUNCHERS,
+    TrustWorkspaceFn,
+    execute_digest,
     execute_ensure,
     execute_pane_close,
     execute_pane_send,
@@ -95,6 +99,7 @@ from .snapshot import (
     parse_workspace_tabs,
     resolve_caller_context,
     resolve_pane_target,
+    resolve_peek_target,
     resolve_tab_target,
     resolve_target,
     verify_claude_busy,
@@ -111,13 +116,15 @@ Exit codes:
   130  Interrupted (SIGINT)
 
 Examples:
+  hcmd digest --json
   hcmd status --workers-only --verify-busy --with-tracker
   hcmd status --plain --fields number,workspace_id,attention,label
   hcmd find --label my-repo --cwd ~/gh/my-repo --verify-busy --json
   hcmd peek w1 --lines 40
-  hcmd wait --until blocked,done --timeout 300 --verify-busy --json
+  hcmd peek w1 --tab review --lines 60
   hcmd ensure --ticket CBRD-10002 --on-existing fail --launcher ai-agent --json
   hcmd send w1 --prompt "Summarize findings in tab 1." --json
+  hcmd wait --until blocked,done --timeout 300 --verify-busy --json  # opt-in only
 """
 
 
@@ -254,12 +261,65 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include workspaces marked deleted or whose cwd is missing",
     )
 
+    p_digest = subparsers.add_parser(
+        "digest",
+        parents=[common],
+        help="Non-blocking summary and harvested snippets for attention/done worker Spaces",
+    )
+    p_digest.add_argument(
+        "--all",
+        action="store_true",
+        help="Include all watched workspaces instead of only blocked/done/blocked-subtabs",
+    )
+    p_digest.add_argument("--workspace", help="Digest one workspace ID, label, or ticket")
+    p_digest.add_argument(
+        "--include-self",
+        action="store_true",
+        help="Include the caller's own HERDR_WORKSPACE_ID",
+    )
+    p_digest.add_argument(
+        "--no-verify-busy",
+        dest="verify_busy",
+        action="store_false",
+        default=True,
+        help="Skip Claude detection-buffer check for background busy panes",
+    )
+    p_digest.add_argument(
+        "--no-tracker",
+        dest="with_tracker",
+        action="store_false",
+        default=True,
+        help="Skip work-tracker correlation",
+    )
+    p_digest.add_argument(
+        "--peek-lines",
+        type=int,
+        default=40,
+        help="Lines to peek for attention/target workspaces (default: 40, 0 disables)",
+    )
+    p_digest.add_argument(
+        "--source",
+        choices=("visible", "recent", "recent-unwrapped", "detection"),
+        default="recent-unwrapped",
+        help="Herdr read source (default: recent-unwrapped)",
+    )
+
     p_peek = subparsers.add_parser(
         "peek",
         parents=[common],
-        help="Read recent output from a workspace's first-tab pane",
+        help="Read recent output from a workspace pane (default: first-tab pane)",
     )
     p_peek.add_argument("target", help="Workspace ID, label, or ticket key")
+    p_peek.add_argument(
+        "--tab",
+        default=None,
+        help="Optional tab ID (w1:t2 or t2), 1-based tab index, or role label",
+    )
+    p_peek.add_argument(
+        "--pane",
+        default=None,
+        help="Optional pane ID (w1:p2 or p2), 1-based pane index, or agent name",
+    )
     p_peek.add_argument("--lines", type=int, default=40, help="Lines to read (default: 40)")
     p_peek.add_argument(
         "--source",
@@ -267,11 +327,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="recent-unwrapped",
         help="Herdr read source (default: recent-unwrapped)",
     )
+    p_peek.add_argument(
+        "--verify-busy",
+        action="store_true",
+        help="Inspect Claude detection buffer to flag background-busy panes as busy_bg",
+    )
 
     p_wait = subparsers.add_parser(
         "wait",
         parents=[common],
-        help="Wait for watched first-tab agents to enter target states",
+        help=(
+            "Opt-in blocking wait until watched first-tab agents enter target states "
+            "(prefer async status/digest by default)"
+        ),
     )
     p_wait.add_argument(
         "--until",
@@ -347,6 +415,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds to wait for launched agent readiness (default: 45)",
     )
     p_ensure.add_argument(
+        "--no-trust",
+        dest="auto_trust",
+        action="store_false",
+        default=True,
+        help="Skip pre-trusting the workspace directory in Claude/Codex/agy configs",
+    )
+    p_ensure.add_argument(
         "--dry-run",
         action="store_true",
         help="Plan changes without creating workspaces or starting agents",
@@ -366,7 +441,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument(
         "--wait",
         action="store_true",
-        help="Wait for agent completion via `herdr agent prompt --wait`",
+        help="Opt-in blocking wait for agent completion (default is async fire-and-return)",
     )
     p_send.add_argument(
         "--timeout",
@@ -452,6 +527,13 @@ def build_parser() -> argparse.ArgumentParser:
             "Max working AI agents across the Herdr session "
             f"(default: {DEFAULT_MAX_SESSION_AGENTS}, 0=unlimited)"
         ),
+    )
+    p_tab_spawn.add_argument(
+        "--no-trust",
+        dest="auto_trust",
+        action="store_false",
+        default=True,
+        help="Skip pre-trusting the target directory in Claude/Codex/agy configs",
     )
     p_tab_spawn.add_argument(
         "--dry-run",
@@ -607,6 +689,13 @@ def build_parser() -> argparse.ArgumentParser:
             "Max working AI agents across the Herdr session "
             f"(default: {DEFAULT_MAX_SESSION_AGENTS}, 0=unlimited)"
         ),
+    )
+    p_pane_spawn.add_argument(
+        "--no-trust",
+        dest="auto_trust",
+        action="store_false",
+        default=True,
+        help="Skip pre-trusting the target directory in Claude/Codex/agy configs",
     )
     p_pane_spawn.add_argument(
         "--dry-run",
@@ -894,6 +983,45 @@ def _dispatch(
             )
         return format_find(result, mode, warnings=warnings)
 
+    if cmd == "digest":
+        if ns.peek_lines < 0:
+            raise CliError(
+                "INVALID_LINES",
+                "--peek-lines must be 0 or a positive integer.",
+                "Pass e.g. `--peek-lines 40` or `--peek-lines 0`.",
+                exit_code=EXIT_USAGE,
+            )
+        spaces = parse_snapshot(client.snapshot(), self_workspace_id=self_workspace_id)
+        if ns.verify_busy:
+            spaces = verify_claude_busy(spaces, client.read_detection)
+        warnings: list[str] = []
+        if ns.with_tracker:
+            items, warn = fetch_work_tracker_items()
+            if warn:
+                warnings.append(warn)
+                if mode.fmt != "json":
+                    sys.stderr.write(f"Warning: {warn}\n")
+            spaces = correlate_work_tracker(spaces, items)
+        filtered = filter_spaces(
+            spaces,
+            workers_only=not bool(ns.include_self),
+            workspace=ns.workspace,
+            sort="attention",
+        )
+        result, digest_warnings = execute_digest(
+            filtered,
+            read_pane=client.read_pane,
+            include_all=bool(ns.all),
+            workspace=ns.workspace,
+            peek_lines=ns.peek_lines,
+            peek_source=ns.source,
+        )
+        for warn in digest_warnings:
+            warnings.append(warn)
+            if mode.fmt != "json":
+                sys.stderr.write(f"Warning: {warn}\n")
+        return format_digest(result, mode, warnings=warnings)
+
     if cmd == "peek":
         if ns.lines <= 0:
             raise CliError(
@@ -902,15 +1030,17 @@ def _dispatch(
                 "Pass e.g. `--lines 40`.",
                 exit_code=EXIT_USAGE,
             )
-        spaces = parse_snapshot(client.snapshot(), self_workspace_id=self_workspace_id)
-        space = resolve_target(spaces, ns.target)
-        if space.primary_pane is None or space.primary_tab_id is None:
-            raise CliError(
-                "NO_PRIMARY_PANE",
-                f"Workspace {space.workspace_id} ({space.label}) has no primary pane.",
-                "Inspect the workspace tabs in Herdr.",
-            )
-        pane = space.primary_pane
+        raw_snap = client.snapshot()
+        spaces = parse_snapshot(raw_snap, self_workspace_id=self_workspace_id)
+        space, resolved_tab_id, pane = resolve_peek_target(
+            raw_snap,
+            spaces,
+            ns.target,
+            tab_selector=ns.tab,
+            pane_selector=ns.pane,
+        )
+        if ns.verify_busy and pane.agent_kind == "claude" and pane.raw_status in {"idle", "done"}:
+            pane = verify_panes_claude_busy([pane], client.read_detection)[0]
         read = client.read_pane(
             pane.pane_id,
             has_agent=pane.agent_kind is not None,
@@ -921,7 +1051,7 @@ def _dispatch(
             PeekResult(
                 workspace_id=space.workspace_id,
                 label=space.label,
-                tab_id=space.primary_tab_id,
+                tab_id=resolved_tab_id,
                 pane_id=pane.pane_id,
                 agent_kind=pane.agent_kind,
                 agent_status=pane.effective_status,
@@ -988,6 +1118,7 @@ def _dispatch(
             start_agent=agent_start,
             env=env,
             select_backend=ai_agent_select_backend,
+            trust_workspace=_make_trust_callback(bool(ns.auto_trust), mode),
             self_workspace_id=self_workspace_id,
             dry_run=bool(ns.dry_run),
             ready_timeout=float(ns.ready_timeout),
@@ -1031,6 +1162,23 @@ def _dispatch(
         "Run `hcmd --help`.",
         exit_code=EXIT_USAGE,
     )
+
+
+def _make_trust_callback(
+    auto_trust: bool,
+    mode: OutputMode,
+) -> TrustWorkspaceFn | None:
+    if not auto_trust:
+        return None
+
+    def _trust(cwd: str, agent_kinds: Sequence[str], env: Mapping[str, str]) -> list[str]:
+        warnings = ensure_trusted_workspace(cwd, agent_kinds, env)
+        if mode.fmt != "json":
+            for warn in warnings:
+                sys.stderr.write(f"Warning: {warn}\n")
+        return warnings
+
+    return _trust
 
 
 def _resolve_cap(
@@ -1154,6 +1302,7 @@ def _dispatch_tab(
             prompt_fn=agent_prompt,
             env=env,
             select_backend=ai_agent_select_backend,
+            trust_workspace=_make_trust_callback(bool(ns.auto_trust), mode),
             dry_run=bool(ns.dry_run),
             ready_timeout=float(ns.ready_timeout),
         )
@@ -1329,6 +1478,7 @@ def _dispatch_pane(
             prompt_fn=agent_prompt,
             env=env,
             select_backend=ai_agent_select_backend,
+            trust_workspace=_make_trust_callback(bool(ns.auto_trust), mode),
             dry_run=bool(ns.dry_run),
             ready_timeout=float(ns.ready_timeout),
         )

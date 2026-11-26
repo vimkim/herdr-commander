@@ -246,8 +246,10 @@ def parse_snapshot(
         primary_pane_id = primary_pane.pane_id if primary_pane else None
         status_counts: dict[str, int] = {}
         extra_pane_count = 0
+        blocked_panes: list[dict[str, str]] = []
         for tab in ws_tabs:
             tid = str(tab["tab_id"])
+            tab_label_clean = strip_tab_decorations(str(tab.get("label") or ""))
             for pane in panes_by_tab.get(tid, []):
                 pid = str(pane["pane_id"])
                 if pid == primary_pane_id:
@@ -255,6 +257,14 @@ def parse_snapshot(
                 extra_pane_count += 1
                 st = _pane_effective_status(pane, agents_by_pane.get(pid))
                 status_counts[st] = status_counts.get(st, 0) + 1
+                if st == "blocked":
+                    blocked_panes.append(
+                        {
+                            "tab_id": tid,
+                            "tab_label": tab_label_clean,
+                            "pane_id": pid,
+                        }
+                    )
 
         sub_tabs = SubTabRollup(
             extra_tab_count=max(0, len(ws_tabs) - 1),
@@ -262,6 +272,7 @@ def parse_snapshot(
             status_counts=status_counts,
             any_blocked=status_counts.get("blocked", 0) > 0,
             any_working=status_counts.get("working", 0) > 0,
+            blocked_panes=tuple(blocked_panes),
         )
 
         tab_summaries = tuple(
@@ -848,6 +859,78 @@ def resolve_pane_target(panes: Sequence[PaneInfo], selector: str) -> PaneInfo:
         f"No pane found matching {selector!r}.",
         "Run `hcmd pane list` to inspect panes in this tab.",
     )
+
+
+def resolve_peek_target(
+    raw_snap: dict[str, Any],
+    spaces: Sequence[SpaceSnapshot],
+    target: str,
+    *,
+    tab_selector: str | None = None,
+    pane_selector: str | None = None,
+) -> tuple[SpaceSnapshot, str, PaneInfo]:
+    """Resolve the workspace, tab ID, and pane for `hcmd peek [--tab] [--pane]`."""
+    space = resolve_target(spaces, target)
+    if tab_selector is None and pane_selector is None:
+        if space.primary_pane is None or space.primary_tab_id is None:
+            raise CliError(
+                "NO_PRIMARY_PANE",
+                f"Workspace {space.workspace_id} ({space.label}) has no primary pane.",
+                "Inspect the workspace tabs in Herdr.",
+            )
+        p = space.primary_pane
+        return (
+            space,
+            space.primary_tab_id,
+            PaneInfo(
+                pane_id=p.pane_id,
+                tab_id=space.primary_tab_id,
+                workspace_id=space.workspace_id,
+                index=0,
+                is_primary=True,
+                is_self=False,
+                cwd=p.cwd,
+                foreground_cwd=p.foreground_cwd,
+                cwd_exists=p.cwd_exists,
+                agent_kind=p.agent_kind,
+                agent_name=p.agent_name,
+                raw_status=p.raw_status,
+                effective_status=p.effective_status,
+                interactive_ready=p.interactive_ready,
+                session_id=p.session_id,
+                revision=p.revision,
+            ),
+        )
+
+    tabs = parse_workspace_tabs(raw_snap, space.workspace_id)
+    if tab_selector is not None:
+        try:
+            tab = resolve_tab_target(tabs, tab_selector)
+        except CliError as exc:
+            if exc.code == "TAB_NOT_FOUND" and tab_selector.isdigit():
+                pos = int(tab_selector)
+                if 1 <= pos <= len(tabs):
+                    tab = tabs[pos - 1]
+                else:
+                    raise
+            else:
+                raise
+        if pane_selector is not None:
+            pane = resolve_pane_target(tab.panes, pane_selector)
+        elif tab.primary_pane is not None:
+            pane = tab.primary_pane
+        else:
+            raise CliError(
+                "NO_PRIMARY_PANE",
+                f"Tab {tab.tab_id} ({tab.base_label}) has no primary pane.",
+                "Inspect the workspace tabs in Herdr.",
+            )
+        return space, tab.tab_id, pane
+
+    assert pane_selector is not None
+    all_panes = [pane for tab in tabs for pane in tab.panes]
+    pane = resolve_pane_target(all_panes, pane_selector)
+    return space, pane.tab_id, pane
 
 
 _PRIMARY_EXACT_REASONS = frozenset(

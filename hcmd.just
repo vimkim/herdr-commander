@@ -52,6 +52,10 @@ plain:
 status-json:
     uv run hcmd status --workers-only --verify-busy --with-tracker --json
 
-# Wait until any worker first tab becomes blocked or done.
+# Show non-blocking worker digest with attention/done peek snippets.
+digest:
+    uv run hcmd digest
+
+# Opt-in blocking wait until any worker first tab becomes blocked or done.
 wait:
     uv run hcmd wait --until blocked,done --timeout 300 --verify-busy

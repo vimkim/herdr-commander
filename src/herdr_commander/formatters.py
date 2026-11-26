@@ -13,6 +13,7 @@ from .models import (
     SCHEMA_VERSION,
     CallerContext,
     CliError,
+    DigestResult,
     EnsureResult,
     FindResult,
     PaneCloseResult,
@@ -430,6 +431,84 @@ def format_peek(result: PeekResult, mode: OutputMode) -> str:
     )
     body = result.text.rstrip("\n")
     return f"{header}\n{body}" if body else f"{header}\n(empty)"
+
+
+def format_digest(
+    result: DigestResult,
+    mode: OutputMode,
+    *,
+    warnings: Sequence[str] = (),
+) -> str:
+    """Render non-blocking `digest` output in json, plain, or human format."""
+    if mode.fmt == "json":
+        payload = result.to_dict()
+        if warnings:
+            payload["warnings"] = list(warnings)
+        return format_json_success(payload)
+
+    if mode.fmt == "plain":
+        rows: list[str] = []
+        for entry in result.entries:
+            space = entry.space
+            pane = space.primary_pane
+            rows.append(
+                "\t".join(
+                    (
+                        space.workspace_id,
+                        space.attention,
+                        pane.agent_kind or "shell" if pane else "-",
+                        _sub_tab_badge(space),
+                        space.ticket_key or "-",
+                        ",".join(str(i) for i in space.work_item_ids) or "-",
+                        space.label,
+                        str(len(entry.peeks)),
+                    )
+                )
+            )
+        return "\n".join(rows)
+
+    summary_bits = [f"{k}={v}" for k, v in result.counts.items() if v]
+    if result.sub_tabs_blocked_count:
+        summary_bits.append(f"sub_tabs_blocked={result.sub_tabs_blocked_count}")
+    header_line = (
+        f"Workers: {result.total_workspaces} ({', '.join(summary_bits)})"
+        if summary_bits
+        else f"Workers: {result.total_workspaces}"
+    )
+    if result.total_workspaces == 0:
+        return f"{header_line}\nNo matching Herdr workspaces."
+    if not result.entries:
+        return f"{header_line}\nNo workspaces currently need attention."
+
+    lines = [header_line]
+    for entry in result.entries:
+        space = entry.space
+        pane = space.primary_pane
+        agent_str = pane.agent_kind or "shell" if pane else "-"
+        if pane and pane.effective_status == "busy_bg":
+            agent_str = f"{agent_str}(bg)"
+        attn_text = _colorize(f"{space.attention:<8}", space.attention, mode)
+        tracker_str = ",".join(f"#{i}" for i in space.work_item_ids) if space.work_item_ids else "-"
+        cwd_str = _shorten_path(pane.cwd) if pane else "-"
+        lines.append("")
+        lines.append(
+            f"{space.workspace_id:<5}  {attn_text}  {agent_str:<9}  "
+            f"{_sub_tab_badge(space):<14}  {tracker_str:<10}  {space.label:<24}  {cwd_str}"
+        )
+        for peek in entry.peeks:
+            if peek.is_primary:
+                kind = peek.agent_kind or "shell"
+                peek_label = f"[primary {peek.pane_id} | {kind}:{peek.agent_status}]"
+            else:
+                peek_label = f"[blocked sub-tab {peek.tab_label} ({peek.tab_id}/{peek.pane_id})]"
+            lines.append(f"  {peek_label}")
+            body = peek.text.rstrip("\n")
+            if body:
+                for body_line in body.splitlines():
+                    lines.append(f"    {body_line}")
+            else:
+                lines.append("    (empty)")
+    return "\n".join(lines)
 
 
 def format_wait(result: WaitResult, mode: OutputMode) -> str:

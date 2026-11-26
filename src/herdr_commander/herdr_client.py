@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import os
+import re
 import select
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
+import tomllib
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -757,3 +763,275 @@ def fetch_work_tracker_items(timeout: float = 5.0) -> tuple[list[dict[str, Any]]
 def workspace_env_overrides() -> dict[str, str]:
     """Return current process environment dictionary."""
     return dict(os.environ)
+
+
+def _canonical_trust_paths(cwd: str) -> list[str]:
+    norm = os.path.normpath(os.path.abspath(os.path.expanduser(cwd)))
+    real = os.path.normpath(os.path.realpath(norm))
+    return [norm] if real == norm else [norm, real]
+
+
+@contextmanager
+def _config_file_lock(config_path: Path) -> Iterator[None]:
+    digest = hashlib.sha256(str(config_path).encode("utf-8")).hexdigest()[:16]
+    lock_path = Path(tempfile.gettempdir()) / f"hcmd-trust-{digest}.lock"
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _write_text_atomic(path: Path, text: str, *, default_mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = (path.stat().st_mode & 0o777) if path.exists() else default_mode
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.tmp.", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _load_json_object(path: Path, *, label: str) -> tuple[dict[str, Any] | None, str | None]:
+    if not path.exists():
+        return {}, None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, f"Could not read {label} ({path}): {exc}"
+    if not raw.strip():
+        return {}, None
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        return None, f"Skipping auto-trust in malformed {label} ({path}): {exc}"
+    if not isinstance(parsed, dict):
+        return None, f"Skipping auto-trust in {label} ({path}): expected top-level JSON object"
+    return parsed, None
+
+
+def _ensure_claude_trust(
+    paths: Sequence[str],
+    env: Mapping[str, str],
+    home: Path,
+) -> str | None:
+    raw_dir = env.get("CLAUDE_CONFIG_DIR", "").strip()
+    config_path = (
+        (Path(raw_dir).expanduser().resolve() / ".claude.json")
+        if raw_dir
+        else (home / ".claude.json")
+    )
+    with _config_file_lock(config_path):
+        data, warn = _load_json_object(config_path, label="Claude config")
+        if warn is not None or data is None:
+            return warn
+        projects = data.get("projects")
+        if projects is None:
+            projects = {}
+            data["projects"] = projects
+        elif not isinstance(projects, dict):
+            return f"Skipping Claude auto-trust in {config_path}: `projects` is not an object"
+
+        changed = False
+        for target_path in paths:
+            entry = projects.get(target_path)
+            if entry is None:
+                projects[target_path] = {"hasTrustDialogAccepted": True}
+                changed = True
+            elif isinstance(entry, dict):
+                if entry.get("hasTrustDialogAccepted") is not True:
+                    entry["hasTrustDialogAccepted"] = True
+                    changed = True
+            else:
+                return (
+                    f"Skipping Claude auto-trust for {target_path} in {config_path}: "
+                    "project entry is not an object"
+                )
+        if not changed:
+            return None
+        serialized = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        json.loads(serialized)
+        _write_text_atomic(config_path, serialized, default_mode=0o600)
+    return None
+
+
+def _ensure_agy_trust(paths: Sequence[str], home: Path) -> str | None:
+    config_path = home / ".gemini" / "antigravity-cli" / "settings.json"
+    with _config_file_lock(config_path):
+        data, warn = _load_json_object(config_path, label="Antigravity settings")
+        if warn is not None or data is None:
+            return warn
+        trusted = data.get("trustedWorkspaces")
+        if trusted is None:
+            trusted = []
+            data["trustedWorkspaces"] = trusted
+        elif not isinstance(trusted, list):
+            return (
+                f"Skipping Antigravity auto-trust in {config_path}: "
+                "`trustedWorkspaces` is not a list"
+            )
+
+        changed = False
+        for target_path in paths:
+            if target_path not in trusted:
+                trusted.append(target_path)
+                changed = True
+        if not changed:
+            return None
+        serialized = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        json.loads(serialized)
+        _write_text_atomic(config_path, serialized, default_mode=0o644)
+    return None
+
+
+def _parse_toml_table_header(line: str) -> dict[str, Any] | None:
+    stripped = line.lstrip()
+    if not stripped.startswith("[") or stripped.startswith("[["):
+        return None
+    try:
+        parsed = tomllib.loads(stripped + "\n")
+    except tomllib.TOMLDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _set_codex_project_trust(raw_text: str, target_path: str) -> str:
+    lines = raw_text.splitlines()
+    header_idx: int | None = None
+    for idx, line in enumerate(lines):
+        parsed_header = _parse_toml_table_header(line)
+        if parsed_header is None:
+            continue
+        projects = parsed_header.get("projects")
+        if isinstance(projects, dict) and set(projects.keys()) == {target_path}:
+            header_idx = idx
+            break
+
+    if header_idx is None:
+        prefix = raw_text
+        if prefix and not prefix.endswith("\n"):
+            prefix += "\n"
+        if prefix and not prefix.endswith("\n\n"):
+            prefix += "\n"
+        return f'{prefix}[projects.{json.dumps(target_path)}]\ntrust_level = "trusted"\n'
+
+    end_idx = len(lines)
+    for idx in range(header_idx + 1, len(lines)):
+        if _parse_toml_table_header(lines[idx]) is not None:
+            end_idx = idx
+            break
+
+    replaced = False
+    for idx in range(header_idx + 1, end_idx):
+        match = re.match(r"^(\s*)trust_level\s*=", lines[idx])
+        if match:
+            lines[idx] = f'{match.group(1)}trust_level = "trusted"'
+            replaced = True
+            break
+    if not replaced:
+        lines.insert(header_idx + 1, 'trust_level = "trusted"')
+    return "\n".join(lines) + "\n"
+
+
+def _ensure_codex_trust(
+    paths: Sequence[str],
+    env: Mapping[str, str],
+    home: Path,
+) -> str | None:
+    raw_home = env.get("CODEX_HOME", "").strip()
+    codex_dir = Path(raw_home).expanduser().resolve() if raw_home else (home / ".codex")
+    config_path = codex_dir / "local.config.toml"
+    with _config_file_lock(config_path):
+        try:
+            raw_text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        except OSError as exc:
+            return f"Could not read Codex config ({config_path}): {exc}"
+        try:
+            parsed = tomllib.loads(raw_text) if raw_text.strip() else {}
+        except tomllib.TOMLDecodeError as exc:
+            return f"Skipping Codex auto-trust in malformed TOML ({config_path}): {exc}"
+
+        projects = parsed.get("projects")
+        if projects is not None and not isinstance(projects, dict):
+            return f"Skipping Codex auto-trust in {config_path}: `projects` is not a table"
+
+        updated_text = raw_text
+        changed = False
+        for target_path in paths:
+            existing = projects.get(target_path) if isinstance(projects, dict) else None
+            if isinstance(existing, dict) and existing.get("trust_level") == "trusted":
+                continue
+            updated_text = _set_codex_project_trust(updated_text, target_path)
+            changed = True
+            try:
+                parsed = tomllib.loads(updated_text)
+            except tomllib.TOMLDecodeError as exc:
+                return f"Skipping Codex auto-trust ({config_path}): generated invalid TOML ({exc})"
+            projects = parsed.get("projects")
+
+        if not changed:
+            return None
+        try:
+            final_parsed = tomllib.loads(updated_text)
+        except tomllib.TOMLDecodeError as exc:
+            return f"Skipping Codex auto-trust ({config_path}): validation failed ({exc})"
+        final_projects = final_parsed.get("projects") or {}
+        for target_path in paths:
+            entry = final_projects.get(target_path)
+            if not isinstance(entry, dict) or entry.get("trust_level") != "trusted":
+                return f"Skipping Codex auto-trust ({config_path}): trust verification failed"
+        _write_text_atomic(config_path, updated_text, default_mode=0o644)
+    return None
+
+
+def ensure_trusted_workspace(
+    cwd: str,
+    agent_kinds: Sequence[str],
+    env: Mapping[str, str],
+    *,
+    home_dir: Path | None = None,
+) -> list[str]:
+    """Pre-trust `cwd` in Claude, Antigravity (`agy`), and/or Codex local configs.
+
+    Returns non-fatal warning strings; malformed user configs are never overwritten.
+    """
+    if not cwd.strip() or not agent_kinds:
+        return []
+    home = home_dir or Path.home()
+    paths = _canonical_trust_paths(cwd)
+    kinds = set(agent_kinds)
+    warnings: list[str] = []
+
+    if "claude" in kinds:
+        try:
+            warn = _ensure_claude_trust(paths, env, home)
+        except OSError as exc:
+            warn = f"Failed to persist Claude workspace trust: {exc}"
+        if warn:
+            warnings.append(warn)
+    if "agy" in kinds:
+        try:
+            warn = _ensure_agy_trust(paths, home)
+        except OSError as exc:
+            warn = f"Failed to persist Antigravity workspace trust: {exc}"
+        if warn:
+            warnings.append(warn)
+    if "codex" in kinds:
+        try:
+            warn = _ensure_codex_trust(paths, env, home)
+        except OSError as exc:
+            warn = f"Failed to persist Codex workspace trust: {exc}"
+        if warn:
+            warnings.append(warn)
+    return warnings

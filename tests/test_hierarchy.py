@@ -475,6 +475,156 @@ class HierarchyOrchestrateTests(unittest.TestCase):
         )
         self.assertEqual(_resolve_cap(3, {"HCMD_MAX_SUB_TABS": "6"}, vars_tuple, 8), 3)
 
+    def test_tab_and_pane_spawn_trigger_trust_only_for_agents(self) -> None:
+        raw = load_fixture()
+        after_tab = copy.deepcopy(raw)
+        after_tab["tabs"].append(
+            {
+                "agent_status": "idle",
+                "focused": False,
+                "label": "review",
+                "number": 5,
+                "pane_count": 1,
+                "tab_id": "w1:t5",
+                "workspace_id": "w1",
+            }
+        )
+        after_tab["panes"].append(
+            {
+                "agent": "agy",
+                "agent_status": "idle",
+                "cwd": "/tmp",
+                "foreground_cwd": "/tmp",
+                "focused": False,
+                "pane_id": "w1:p5",
+                "revision": 103,
+                "tab_id": "w1:t5",
+                "workspace_id": "w1",
+            }
+        )
+        after_tab["agents"].append(
+            {
+                "agent": "agy",
+                "agent_status": "idle",
+                "cwd": "/tmp",
+                "interactive_ready": True,
+                "name": "review",
+                "pane_id": "w1:p5",
+                "revision": 103,
+                "tab_id": "w1:t5",
+                "workspace_id": "w1",
+            }
+        )
+        after_pane = copy.deepcopy(raw)
+        after_pane["panes"].append(
+            {
+                "agent": "claude",
+                "agent_status": "idle",
+                "cwd": "/tmp",
+                "foreground_cwd": "/tmp",
+                "focused": False,
+                "pane_id": "w1:p6",
+                "revision": 104,
+                "tab_id": "w1:t1",
+                "workspace_id": "w1",
+            }
+        )
+        after_pane["agents"].append(
+            {
+                "agent": "claude",
+                "agent_status": "idle",
+                "cwd": "/tmp",
+                "interactive_ready": True,
+                "name": "worker",
+                "pane_id": "w1:p6",
+                "revision": 104,
+                "tab_id": "w1:t1",
+                "workspace_id": "w1",
+            }
+        )
+
+        trust_calls: list[tuple[str, tuple[str, ...]]] = []
+
+        def fake_trust(cwd: str, kinds: object, _env: object) -> list[str]:
+            trust_calls.append((cwd, tuple(kinds)))  # type: ignore[arg-type]
+            return []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            repo_dir.mkdir()
+            env = {"HERDR_WORKSPACE_ID": "w1", "HERDR_TAB_ID": "w1:t1", "HERDR_PANE_ID": "w1:p1"}
+            tabs = parse_workspace_tabs(raw, "w1", self_tab_id="w1:t1", self_pane_id="w1:p1")
+            caller = resolve_caller_context(raw, env)
+
+            tab_plan = plan_tab_spawn(
+                caller=caller,
+                tabs=tabs,
+                label="review",
+                cwd=str(repo_dir),
+                launcher_name="ay",
+            )
+            execute_tab_spawn(
+                tab_plan,
+                client=FakeClient([after_tab]),
+                create_tab=lambda wid, *, label, cwd, env_vars=None: {
+                    "tab_id": "w1:t5",
+                    "pane_id": "w1:p5",
+                },
+                run_pane=lambda *_a: None,
+                start_agent=lambda *_a, **_kw: {},
+                prompt_fn=lambda *_a, **_kw: {},
+                env=env,
+                trust_workspace=fake_trust,
+                poll_interval=0.0,
+                sleep_fn=lambda _s: None,
+            )
+
+            pane_plan = plan_pane_spawn(
+                caller=caller,
+                tabs=tabs,
+                cwd=str(repo_dir),
+                launcher_name="ai-round",
+            )
+            execute_pane_spawn(
+                pane_plan,
+                client=FakeClient([after_pane]),
+                split_pane=lambda pid, *, direction, cwd, env_vars=None: {"pane_id": "w1:p6"},
+                run_pane=lambda *_a: None,
+                start_agent=lambda *_a, **_kw: {},
+                prompt_fn=lambda *_a, **_kw: {},
+                env=env,
+                trust_workspace=fake_trust,
+                poll_interval=0.0,
+                sleep_fn=lambda _s: None,
+            )
+
+            # Shell pane spawn does NOT call trust_workspace.
+            shell_plan = plan_pane_spawn(
+                caller=caller,
+                tabs=tabs,
+                cwd=str(repo_dir),
+                launcher_name="shell",
+                shell_cmd="just test",
+            )
+            execute_pane_spawn(
+                shell_plan,
+                client=FakeClient([raw]),
+                split_pane=lambda pid, *, direction, cwd, env_vars=None: {"pane_id": "w1:p7"},
+                run_pane=lambda *_a: None,
+                start_agent=lambda *_a, **_kw: {},
+                prompt_fn=lambda *_a, **_kw: {},
+                env=env,
+                trust_workspace=fake_trust,
+            )
+
+            self.assertEqual(
+                trust_calls,
+                [
+                    (str(repo_dir), ("agy",)),
+                    (str(repo_dir), ("claude",)),
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
