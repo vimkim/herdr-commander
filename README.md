@@ -27,8 +27,8 @@ Running multiple coding agents across Herdr workspaces breaks down fast when coo
 
 1. **4-tier Herdr hierarchy with role enforcement**:
    - **Herdr Commander (`hcmd`)** coordinates across Spaces (`status`, `find`, `ensure`, `send`, `wait`, `peek`).
-   - **Space Leaders (`tabs[0]`, `panes[0]`)** manage up to 8 sub-tabs (`Alt+Shift+1..9`) via `hcmd tab` and tag spawned sub-tabs with `HERDR_TAB_ROLE=worker`.
-   - **Tab Leaders (`tabs[1..8]`, `panes[0]`)** manage up to 3 worker panes (`2×2` grid) inside their own tab via `hcmd pane`, tag split panes with `HERDR_PANE_ROLE=worker`, and never create tabs.
+   - **Space Leads (`tabs[0]`, `panes[0]`)** manage up to 8 sub-tabs (`Alt+Shift+1..9`) via `hcmd tab` and tag spawned sub-tabs with `HERDR_TAB_ROLE=worker`.
+   - **Tab Leads (`tabs[1..8]`, `panes[0]`)** manage up to 3 worker panes (`2×2` grid) inside their own tab via `hcmd pane`, tag split panes with `HERDR_PANE_ROLE=worker`, and never create tabs.
    - **Pane Workers (`panes[1..3]`)** execute assigned work only; recursive tab and pane spawning is blocked.
 2. **Layout-order `tabs[0]` inspection**: `hcmd` never assumes a workspace's primary tab is `t1` or `number == 1`. It always resolves `tabs[0]` and `panes[0]` in Herdr layout order and rolls up all sub-tabs and split panes alongside it.
 3. **Socket event waits instead of `sleep` polling**: `hcmd wait`, `hcmd tab wait`, and `hcmd pane wait` subscribe directly to Herdr Unix socket events until watched agents enter target states (`blocked`, `done`, `working`, `busy_bg`, `idle`, `shell`, `unknown`), using `--verify-busy` when Claude background tasks need detection-buffer confirmation.
@@ -61,8 +61,8 @@ All subcommands accept common output and socket flags: `--json`, `--plain`, `--n
 | `hcmd wait` | Commander | Subscribe to Herdr socket events until watched first-tabs match `--until` |
 | `hcmd ensure` | Commander | Idempotently create or reuse a workspace and start its first-tab agent |
 | `hcmd send` | Commander | Validate readiness and dispatch a prompt (inline or `--prompt -` stdin) |
-| `hcmd tab` | Space Leader | `list`, `spawn`, `peek`, `send`, `wait`, `close` sub-tabs in own Space |
-| `hcmd pane` | Tab / Space Leader | `list`, `spawn`, `peek`, `send`, `wait`, `close` worker panes in own tab |
+| `hcmd tab` | Space Lead | `list`, `spawn`, `peek`, `send`, `wait`, `close` sub-tabs in own Space |
+| `hcmd pane` | Tab / Space Lead | `list`, `spawn`, `peek`, `send`, `wait`, `close` worker panes in own tab |
 
 ### `status`
 
@@ -159,9 +159,9 @@ Refuses `blocked` agents (`AGENT_BLOCKED`), `working`/`busy_bg` agents without `
 
 ## Hierarchy and Guardrails
 
-### `tab` (Space Leader)
+### `tab` (Space Lead)
 
-Manage worker sub-tabs inside the caller's own Space (up to 8 sub-tabs by default, total 9 tabs matching `Alt+Shift+1..9`). Enforces Space Leader identity (`tabs[0]`, `panes[0]`, not `HERDR_TAB_ROLE=worker` or `HERDR_PANE_ROLE=worker`) and tags created tabs with `HERDR_TAB_ROLE=worker` to block recursive tab spawning.
+Manage worker sub-tabs inside the caller's own Space (up to 8 sub-tabs by default, total 9 tabs matching `Alt+Shift+1..9`). Enforces Space Lead identity (`tabs[0]`, `panes[0]`, not `HERDR_TAB_ROLE=worker` or `HERDR_PANE_ROLE=worker`) and tags created tabs with `HERDR_TAB_ROLE=worker` to block recursive tab spawning.
 
 ```bash
 hcmd tab list --verify-busy
@@ -172,9 +172,9 @@ hcmd tab send review --prompt "Check edge cases." --json
 hcmd tab close review
 ```
 
-### `pane` (Tab Leader)
+### `pane` (Tab Lead)
 
-Manage worker panes inside the caller's own tab (up to 3 worker panes by default, forming a `2×2` grid via `--direction {auto,right,down}`). Allowed for Space/Tab Leaders (`panes[0]`, not `HERDR_PANE_ROLE=worker`); tags split panes with `HERDR_PANE_ROLE=worker`.
+Manage worker panes inside the caller's own tab (up to 3 worker panes by default, forming a `2×2` grid via `--direction {auto,right,down}`). Allowed for Space/Tab Leads (`panes[0]`, not `HERDR_PANE_ROLE=worker`); tags split panes with `HERDR_PANE_ROLE=worker`.
 
 ```bash
 hcmd pane list --verify-busy

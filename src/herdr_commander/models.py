@@ -263,7 +263,7 @@ class CallerContext:
     pane_id: str
     tab_index: int
     pane_index: int
-    role: str  # "space_leader" | "tab_leader" | "leaf_worker"
+    role: str  # "space_lead" | "tab_lead" | "pane_worker"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

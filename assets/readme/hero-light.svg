@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="600" viewBox="0 0 1200 600" role="img" aria-labelledby="title desc">
   <title id="title">herdr-commander (hcmd) Architecture Overview</title>
-  <desc id="desc">4-tier Herdr hierarchy (Herdr Commander, Space Leaders tabs[0], Tab Leaders tabs[1..8], Pane Workers panes[1..3]) paired with hcmd status/find/peek/wait, socket event waits without sleep polling, and work-tracker correlation.</desc>
+  <desc id="desc">4-tier Herdr hierarchy (Herdr Commander, Space Leads tabs[0], Tab Leads tabs[1..8], Pane Workers panes[1..3]) paired with hcmd status/find/peek/wait, socket event waits without sleep polling, and work-tracker correlation.</desc>
   <defs>
     <marker id="arrow-muted" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
       <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#57606a"/>
@@ -61,13 +61,13 @@
   <!-- Connector 1 -> 2 -->
   <line x1="356" y1="225" x2="356" y2="238" stroke="#57606a" stroke-width="1.5" marker-end="url(#arrow-muted)"/>
 
-  <!-- TIER 2: Space Leaders -->
+  <!-- TIER 2: Space Leads -->
   <g>
     <rect x="32" y="244" width="648" height="108" rx="10" fill="#f6f8fa" stroke="#4ac26b" stroke-width="1.2"/>
     <rect x="40" y="255" width="4" height="86" rx="2" fill="#1a7f37"/>
     <rect x="54" y="256" width="60" height="21" rx="5" fill="#dafbe1" stroke="#4ac26b" stroke-width="1"/>
     <text x="84" y="270.5" class="mono" font-size="11" font-weight="700" fill="#1a7f37" text-anchor="middle">TIER 2</text>
-    <text x="124" y="271" class="sans" font-size="15.5" font-weight="700" fill="#1f2328">Space Leaders</text>
+    <text x="124" y="271" class="sans" font-size="15.5" font-weight="700" fill="#1f2328">Space Leads</text>
     <rect x="240" y="256" width="144" height="21" rx="5" fill="#eaeef2" stroke="#d0d7de" stroke-width="1"/>
     <text x="312" y="270.5" class="mono" font-size="11.5" font-weight="600" fill="#1a7f37" text-anchor="middle">tabs[0], panes[0]</text>
     <text x="662" y="270.5" class="mono" font-size="11.5" fill="#57606a" text-anchor="end">Workspace Primary</text>
@@ -80,13 +80,13 @@
   <!-- Connector 2 -> 3 -->
   <line x1="356" y1="355" x2="356" y2="368" stroke="#57606a" stroke-width="1.5" marker-end="url(#arrow-muted)"/>
 
-  <!-- TIER 3: Tab Leaders -->
+  <!-- TIER 3: Tab Leads -->
   <g>
     <rect x="32" y="374" width="648" height="96" rx="10" fill="#f6f8fa" stroke="#c297ff" stroke-width="1.2"/>
     <rect x="40" y="385" width="4" height="74" rx="2" fill="#8250df"/>
     <rect x="54" y="386" width="60" height="21" rx="5" fill="#fbefff" stroke="#c297ff" stroke-width="1"/>
     <text x="84" y="400.5" class="mono" font-size="11" font-weight="700" fill="#8250df" text-anchor="middle">TIER 3</text>
-    <text x="124" y="401" class="sans" font-size="15.5" font-weight="700" fill="#1f2328">Tab Leaders</text>
+    <text x="124" y="401" class="sans" font-size="15.5" font-weight="700" fill="#1f2328">Tab Leads</text>
     <rect x="222" y="386" width="166" height="21" rx="5" fill="#eaeef2" stroke="#d0d7de" stroke-width="1"/>
     <text x="305" y="400.5" class="mono" font-size="11.5" font-weight="600" fill="#8250df" text-anchor="middle">tabs[1..8], panes[0]</text>
     <text x="662" y="400.5" class="mono" font-size="11.5" fill="#57606a" text-anchor="end">build · test · review · ci</text>
@@ -107,7 +107,7 @@
     <text x="124" y="519" class="sans" font-size="15.5" font-weight="700" fill="#1f2328">Pane Workers</text>
     <rect x="238" y="504" width="102" height="21" rx="5" fill="#eaeef2" stroke="#d0d7de" stroke-width="1"/>
     <text x="289" y="518.5" class="mono" font-size="11.5" font-weight="600" fill="#9a6700" text-anchor="middle">panes[1..3]</text>
-    <text x="662" y="518.5" class="mono" font-size="11.5" fill="#57606a" text-anchor="end">Leaf Executors</text>
+    <text x="662" y="518.5" class="mono" font-size="11.5" fill="#57606a" text-anchor="end">Task Executors</text>
 
     <text x="54" y="544" class="mono" font-size="12" fill="#1f2328">ai-agent (ay / ai-round)  ·  --launcher shell (bypasses AI agent cap)</text>
     <text x="54" y="564" class="sans" font-size="12" fill="#57606a">Executes assigned work only · recursive tab and pane spawning blocked</text>

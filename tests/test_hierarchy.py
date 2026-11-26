@@ -78,9 +78,9 @@ class HierarchySnapshotTests(unittest.TestCase):
             raw,
             {"HERDR_WORKSPACE_ID": "w2", "HERDR_TAB_ID": "w2:t4", "HERDR_PANE_ID": "w2:p4"},
         )
-        self.assertEqual(lead_ctx.role, "space_leader")
+        self.assertEqual(lead_ctx.role, "space_lead")
 
-        # Worker env override forces tab_leader even if index were 0.
+        # Worker env override forces tab_lead even if index were 0.
         worker_tab_env = resolve_caller_context(
             raw,
             {
@@ -90,24 +90,24 @@ class HierarchySnapshotTests(unittest.TestCase):
                 "HERDR_TAB_ROLE": "worker",
             },
         )
-        self.assertEqual(worker_tab_env.role, "tab_leader")
+        self.assertEqual(worker_tab_env.role, "tab_lead")
 
-        # Non-primary tab primary pane -> tab_leader.
+        # Non-primary tab primary pane -> tab_lead.
         tab_lead_ctx = resolve_caller_context(
             raw,
             {"HERDR_WORKSPACE_ID": "w1", "HERDR_TAB_ID": "w1:t2", "HERDR_PANE_ID": "w1:p2"},
         )
-        self.assertEqual(tab_lead_ctx.role, "tab_leader")
+        self.assertEqual(tab_lead_ctx.role, "tab_lead")
 
-        # Second pane in a tab -> leaf_worker.
-        leaf_ctx = resolve_caller_context(
+        # Second pane in a tab -> pane_worker.
+        worker_ctx = resolve_caller_context(
             raw,
             {"HERDR_WORKSPACE_ID": "w2", "HERDR_TAB_ID": "w2:t4", "HERDR_PANE_ID": "w2:p5"},
         )
-        self.assertEqual(leaf_ctx.role, "leaf_worker")
+        self.assertEqual(worker_ctx.role, "pane_worker")
 
-        # HERDR_PANE_ROLE=worker forces leaf_worker.
-        leaf_env_ctx = resolve_caller_context(
+        # HERDR_PANE_ROLE=worker forces pane_worker.
+        worker_env_ctx = resolve_caller_context(
             raw,
             {
                 "HERDR_WORKSPACE_ID": "w1",
@@ -116,7 +116,7 @@ class HierarchySnapshotTests(unittest.TestCase):
                 "HERDR_PANE_ROLE": "worker",
             },
         )
-        self.assertEqual(leaf_env_ctx.role, "leaf_worker")
+        self.assertEqual(worker_env_ctx.role, "pane_worker")
 
     def test_workspace_and_session_agent_counts(self) -> None:
         raw = load_fixture()
@@ -140,7 +140,7 @@ class HierarchyOrchestrateTests(unittest.TestCase):
             {"HERDR_WORKSPACE_ID": "w1", "HERDR_TAB_ID": "w1:t2", "HERDR_PANE_ID": "w1:p2"},
         )
 
-        # Tab Leader cannot spawn tabs.
+        # Tab Lead cannot spawn tabs.
         with self.assertRaises(CliError) as ctx:
             plan_tab_spawn(
                 caller=tab_lead,
@@ -150,7 +150,7 @@ class HierarchyOrchestrateTests(unittest.TestCase):
                 launcher_name="ai-agent",
                 dir_exists=lambda _p: True,
             )
-        self.assertEqual(ctx.exception.code, "NOT_SPACE_LEADER")
+        self.assertEqual(ctx.exception.code, "NOT_SPACE_LEAD")
 
         # Sub-tab cap enforced (w1 already has 2 sub-tabs).
         with self.assertRaises(CliError) as ctx:
@@ -308,19 +308,19 @@ class HierarchyOrchestrateTests(unittest.TestCase):
         three_panes = (*tab.panes, tab.panes[1])
         self.assertEqual(choose_split_target(three_panes, "auto"), ("w2:p4", "down"))
 
-        leaf = resolve_caller_context(
+        worker = resolve_caller_context(
             raw,
             {"HERDR_WORKSPACE_ID": "w2", "HERDR_TAB_ID": "w2:t4", "HERDR_PANE_ID": "w2:p5"},
         )
         with self.assertRaises(CliError) as ctx:
             plan_pane_spawn(
-                caller=leaf,
+                caller=worker,
                 tabs=tabs,
                 cwd="/tmp",
                 launcher_name="shell",
                 dir_exists=lambda _p: True,
             )
-        self.assertEqual(ctx.exception.code, "NOT_TAB_LEADER")
+        self.assertEqual(ctx.exception.code, "NOT_TAB_LEAD")
 
         tab_lead = resolve_caller_context(
             raw,

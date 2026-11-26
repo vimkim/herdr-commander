@@ -695,11 +695,11 @@ def resolve_caller_context(
     tab_role_env = env.get("HERDR_TAB_ROLE", "").strip().lower()
     pane_role_env = env.get("HERDR_PANE_ROLE", "").strip().lower()
     if pane_role_env == "worker" or pane.index > 0:
-        role = "leaf_worker"
+        role = "pane_worker"
     elif tab_role_env == "worker" or tab.index > 0:
-        role = "tab_leader"
+        role = "tab_lead"
     else:
-        role = "space_leader"
+        role = "space_lead"
 
     return CallerContext(
         workspace_id=workspace_id,
@@ -712,7 +712,7 @@ def resolve_caller_context(
 
 
 def count_workspace_non_primary_agents(tabs: Sequence[WorkspaceTabInfo]) -> int:
-    """Count live AI agent panes in a workspace excluding the primary Space Leader pane."""
+    """Count live AI agent panes in a workspace excluding the primary Space Lead pane."""
     count = 0
     for tab in tabs:
         for pane in tab.panes:

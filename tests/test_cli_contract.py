@@ -261,7 +261,7 @@ class CliContractTests(unittest.TestCase):
                 )
                 self.assertEqual(tab_proc.returncode, 0, tab_proc.stderr)
                 tab_data = json.loads(tab_proc.stdout)["data"]
-                self.assertEqual(tab_data["caller"]["role"], "space_leader")
+                self.assertEqual(tab_data["caller"]["role"], "space_lead")
                 self.assertEqual(tab_data["sub_tab_count"], 2)
 
                 pane_proc = run_cli(
@@ -275,7 +275,7 @@ class CliContractTests(unittest.TestCase):
                 )
                 self.assertEqual(pane_proc.returncode, 0, pane_proc.stderr)
                 pane_data = json.loads(pane_proc.stdout)["data"]
-                self.assertEqual(pane_data["caller"]["role"], "tab_leader")
+                self.assertEqual(pane_data["caller"]["role"], "tab_lead")
                 self.assertEqual(pane_data["worker_pane_count"], 1)
 
     def test_find_json_plain_human_and_errors(self) -> None:

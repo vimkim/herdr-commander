@@ -388,7 +388,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tab = subparsers.add_parser(
         "tab",
         parents=[common],
-        help="Manage sub-tabs inside the caller's Space (Space Leader only)",
+        help="Manage sub-tabs inside the caller's Space (Space Lead only)",
     )
     tab_sub = p_tab.add_subparsers(dest="tab_command", metavar="SUBCOMMAND")
 
@@ -536,7 +536,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pane = subparsers.add_parser(
         "pane",
         parents=[common],
-        help="Manage worker panes inside the caller's tab (Space/Tab Leader only)",
+        help="Manage worker panes inside the caller's tab (Space/Tab Lead only)",
     )
     pane_sub = p_pane.add_subparsers(dest="pane_command", metavar="SUBCOMMAND")
 

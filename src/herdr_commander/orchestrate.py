@@ -1219,11 +1219,11 @@ def plan_tab_spawn(
     dir_exists: Callable[[str], bool] = os.path.isdir,
 ) -> TabSpawnPlan:
     """Create a validated plan for spawning a worker sub-tab inside the caller's Space."""
-    if caller.role != "space_leader":
+    if caller.role != "space_lead":
         raise CliError(
-            "NOT_SPACE_LEADER",
-            f"Only a Space Leader (tabs[0], panes[0]) may create tabs; caller is {caller.role}.",
-            "Run `hcmd pane spawn` inside a Tab Leader, or report to Tab 1.",
+            "NOT_SPACE_LEAD",
+            f"Only a Space Lead (tabs[0], panes[0]) may create tabs; caller is {caller.role}.",
+            "Run `hcmd pane spawn` inside a Tab Lead, or report to Tab 1.",
             details=caller.to_dict(),
         )
     clean_label = label.strip()
@@ -1406,12 +1406,12 @@ def execute_tab_send(
     dry_run: bool,
     prompt_fn: PromptAgentFn,
 ) -> SendResult:
-    """Validate Space Leader authority and send a prompt to a sub-tab's primary pane."""
-    if caller.role != "space_leader":
+    """Validate Space Lead authority and send a prompt to a sub-tab's primary pane."""
+    if caller.role != "space_lead":
         raise CliError(
-            "NOT_SPACE_LEADER",
-            f"Only a Space Leader may send prompts across tabs; caller is {caller.role}.",
-            "Report results in your own pane or use `hcmd pane send` if you are a Tab Leader.",
+            "NOT_SPACE_LEAD",
+            f"Only a Space Lead may send prompts across tabs; caller is {caller.role}.",
+            "Report results in your own pane or use `hcmd pane send` if you are a Tab Lead.",
             details=caller.to_dict(),
         )
     return _send_to_pane(
@@ -1504,10 +1504,10 @@ def execute_tab_close(
     close_tab: CloseTabFn,
 ) -> TabCloseResult:
     """Close a non-primary sub-tab in the caller's Space."""
-    if caller.role != "space_leader":
+    if caller.role != "space_lead":
         raise CliError(
-            "NOT_SPACE_LEADER",
-            f"Only a Space Leader may close tabs; caller is {caller.role}.",
+            "NOT_SPACE_LEAD",
+            f"Only a Space Lead may close tabs; caller is {caller.role}.",
             "Leave tab lifecycle management to Tab 1.",
             details=caller.to_dict(),
         )
@@ -1561,10 +1561,10 @@ def plan_pane_spawn(
     dir_exists: Callable[[str], bool] = os.path.isdir,
 ) -> PaneSpawnPlan:
     """Create a validated plan for splitting a worker pane inside the caller's tab."""
-    if caller.role == "leaf_worker":
+    if caller.role == "pane_worker":
         raise CliError(
-            "NOT_TAB_LEADER",
-            "Leaf worker panes cannot split new panes.",
+            "NOT_TAB_LEAD",
+            "Pane workers cannot split new panes.",
             "Report back to this tab's primary pane (panes[0]).",
             details=caller.to_dict(),
         )
@@ -1777,11 +1777,11 @@ def execute_pane_send(
     dry_run: bool,
     prompt_fn: PromptAgentFn,
 ) -> SendResult:
-    """Validate Tab Leader authority and send a prompt to a worker pane inside the same tab."""
-    if caller.role == "leaf_worker":
+    """Validate Tab Lead authority and send a prompt to a worker pane inside the same tab."""
+    if caller.role == "pane_worker":
         raise CliError(
-            "NOT_TAB_LEADER",
-            "Leaf worker panes cannot send prompts to sibling panes.",
+            "NOT_TAB_LEAD",
+            "Pane workers cannot send prompts to sibling panes.",
             "Report back to this tab's primary pane (panes[0]).",
             details=caller.to_dict(),
         )
@@ -1880,10 +1880,10 @@ def execute_pane_close(
     close_pane: ClosePaneFn,
 ) -> PaneCloseResult:
     """Close a non-primary worker pane inside the caller's tab."""
-    if caller.role == "leaf_worker":
+    if caller.role == "pane_worker":
         raise CliError(
-            "NOT_TAB_LEADER",
-            "Leaf worker panes cannot close sibling panes.",
+            "NOT_TAB_LEAD",
+            "Pane workers cannot close sibling panes.",
             "Report back to this tab's primary pane (panes[0]).",
             details=caller.to_dict(),
         )

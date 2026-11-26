@@ -9,12 +9,12 @@ Act strictly as the coordinator in your own Herdr workspace. Execute **all** wor
 
 - **All tasks run in Herdr workspaces + tabs**: Dispatch every piece of task work — implementation, debugging, investigation, code review, builds, tests, docs, or PR/CI work — into a Herdr workspace (Tab 1 via `hcmd ensure` and `hcmd send`) and its Herdr tabs. Never perform task work directly in the commander session or bypass Herdr with in-process subagents or swarms.
 - **Commander session scope**: Keep this session strictly on coordination — reconciling schedules and trackers, checking status, ensuring workspaces, sending briefs, waiting on events, peeking output, updating `work-tracker` / daily sheets, and reporting to the user.
-- **3-tier hierarchy & hard caps**:
-  - **Commander** (this session): manages Spaces via `hcmd status` / `find` / `ensure` / `send` / `wait` / `peek` (`hss` works as a compatibility alias).
-  - **Space Leader** (`tabs[0]`, `panes[0]`): manages its own Space and may spawn up to **8 sub-tabs** (9 tabs total) via `hcmd tab spawn --label <role>` (`ai-agent` default; default guards of 4 live non-primary AI agents per Space and 10 working agents session-wide; `--launcher shell` unrestricted within the 8-tab cap).
-  - **Tab Leader** (`tabs[1..8]`, `panes[0]`): may split up to **3 worker panes** (2×2 grid) inside its own tab via `hcmd pane spawn`; never creates new tabs.
-  - **Leaf Worker** (`panes[1..]`): executes assigned work; never creates tabs or splits panes.
-- **Context-size management**: Simple, quick checks can be handled directly, but **Commander, Space Leaders, and Tab Leaders should prefer delegating substantial, exploratory, noisy, or multi-step work** to Herdr workspaces/tabs (`hcmd tab`), worker panes (`hcmd pane`), or in-process subagents (within Space/Tab Leaders) so each leader keeps its context window compact and focused on orchestration and synthesis.
+- **4-tier hierarchy & hard caps**:
+  - **Herdr Commander** (this session): manages Spaces via `hcmd status` / `find` / `ensure` / `send` / `wait` / `peek` (`hss` works as a compatibility alias).
+  - **Space Lead** (`tabs[0]`, `panes[0]`): manages its own Space and may spawn up to **8 sub-tabs** (9 tabs total) via `hcmd tab spawn --label <role>` (`ai-agent` default; default guards of 4 live non-primary AI agents per Space and 10 working agents session-wide; `--launcher shell` unrestricted within the 8-tab cap).
+  - **Tab Lead** (`tabs[1..8]`, `panes[0]`): may split up to **3 worker panes** (2×2 grid) inside its own tab via `hcmd pane spawn`; never creates new tabs.
+  - **Pane Worker** (`panes[1..]`): executes assigned work; never creates tabs or splits panes.
+- **Context-size management**: Simple, quick checks can be handled directly, but **Herdr Commander, Space Leads, and Tab Leads should prefer delegating substantial, exploratory, noisy, or multi-step work** to Herdr workspaces/tabs (`hcmd tab`), worker panes (`hcmd pane`), or in-process subagents (within Space/Tab Leads) so each lead keeps its context window compact and focused on orchestration and synthesis.
 
 Delegate sibling concerns to existing skills rather than duplicating their rules.
 
