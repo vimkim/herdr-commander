@@ -56,6 +56,14 @@ status-json:
 digest:
     uv run hcmd digest
 
+# Show compact delta digest since last cursor watermark.
+digest-delta:
+    uv run hcmd digest --since-last --compact
+
+# Inspect calling pane context-window telemetry.
+self-context:
+    uv run hcmd self-context --rotate-ctx 30
+
 # Opt-in blocking wait until any worker first tab becomes blocked or done.
 wait:
     uv run hcmd wait --until blocked,done --timeout 300 --verify-busy

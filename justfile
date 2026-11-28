@@ -13,11 +13,11 @@ sync:
     just hcmd::install
     just install-skill
 
-# Symlink skill/herdr-commander for shared agents, Claude, Codex, and Antigravity (agy).
+# Symlink every skill under skill/* for shared agents, Claude, Codex, and Antigravity (agy).
 install-skill:
     #!/usr/bin/env bash
     set -euo pipefail
-    src="{{justfile_directory()}}/skill/herdr-commander"
+    skill_root="{{justfile_directory()}}/skill"
     agents_dir="$HOME/.agents/skills"
     claude_dir="$HOME/.claude/skills"
     codex_dir="${CODEX_HOME:-$HOME/.codex}/skills"
@@ -35,10 +35,14 @@ install-skill:
         printf 'Linked %s -> %s\n' "$link_path" "$target"
     }
 
-    link_safe "$src" "$agents_dir/herdr-commander"
-    link_safe "../../.agents/skills/herdr-commander" "$claude_dir/herdr-commander"
-    link_safe "$agents_dir/herdr-commander" "$codex_dir/herdr-commander"
-    link_safe "$agents_dir/herdr-commander" "$agy_dir/herdr-commander"
+    for src in "$skill_root"/*; do
+        [ -d "$src" ] && [ -f "$src/SKILL.md" ] || continue
+        name="$(basename "$src")"
+        link_safe "$src" "$agents_dir/$name"
+        link_safe "../../.agents/skills/$name" "$claude_dir/$name"
+        link_safe "$agents_dir/$name" "$codex_dir/$name"
+        link_safe "$agents_dir/$name" "$agy_dir/$name"
+    done
 
 # Check lint and formatting.
 lint:

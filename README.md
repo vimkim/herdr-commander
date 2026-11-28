@@ -42,12 +42,12 @@ Run from a clean `main` checkout:
 just sync
 ```
 
-This installs `herdr-commander`, `hcmd`, and compatibility alias `hss` via `uv tool install --reinstall .` and symlinks `skill/herdr-commander` into:
+This installs `herdr-commander`, `hcmd`, and compatibility alias `hss` via `uv tool install --reinstall .` and symlinks every skill directory under `skill/*` (`herdr-commander`, `herdr-commander-init`, `hcmd-init`, `hcmd-check`, `hcmd-auto`) into:
 
-- `~/.agents/skills/herdr-commander`
-- `~/.claude/skills/herdr-commander` (Claude)
-- `${CODEX_HOME:-~/.codex}/skills/herdr-commander` (Codex)
-- `~/.gemini/config/skills/herdr-commander` (Antigravity / `agy`)
+- `~/.agents/skills/<skill>`
+- `~/.claude/skills/<skill>` (Claude)
+- `${CODEX_HOME:-~/.codex}/skills/<skill>` (Codex)
+- `~/.gemini/config/skills/<skill>` (Antigravity / `agy`)
 
 ## Commands
 
@@ -61,7 +61,9 @@ All subcommands accept common output and socket flags: `--json`, `--plain`, `--n
 | `hcmd peek` | Commander | Read recent terminal output from a Space pane (default: first-tab pane) |
 | `hcmd ensure` | Commander | Idempotently create or reuse a workspace and start its first-tab agent |
 | `hcmd send` | Commander | Validate readiness and dispatch a prompt (inline or `--prompt -` stdin) |
-| `hcmd wait` | Commander (opt-in) | Blocking wait on Herdr socket events until watched first-tabs match `--until` |
+| `hcmd wait` | Commander (opt-in) | Blocking wait on Herdr socket events until watched tabs/deltas match |
+| `hcmd self-context` | Commander | Parse calling pane statusline context window % and rate-limit telemetry |
+| `hcmd rotate` | Commander | 2-phase same-tab Commander pane rotation with handoff state & `--ack` |
 | `hcmd tab` | Space Lead | `list`, `spawn`, `peek`, `send`, `wait`, `close` sub-tabs in own Space |
 | `hcmd pane` | Tab / Space Lead | `list`, `spawn`, `peek`, `send`, `wait`, `close` worker panes in own tab |
 
@@ -71,12 +73,15 @@ Non-blocking Commander check-in command. Defaults to `--workers-only`, `--verify
 
 ```bash
 hcmd digest
-hcmd digest --json
-hcmd digest --all --peek-lines 0
+hcmd digest --since-last --compact --json
+hcmd digest --since-last --cursor auto-watch --no-advance --json
+hcmd digest --all --include-idle --peek-lines 0
 hcmd digest --workspace CBRD-10001 --peek-lines 60
 ```
 
-- `--all` includes `working`/`idle`/`shell` Spaces in addition to attention-needed ones; `--workspace` digests a single Space; `--include-self` includes the caller's Space; `--no-verify-busy` / `--no-tracker` disable extra checks; `--peek-lines 0` skips terminal reads.
+- `--since-last` tracks per-workspace watermarks under `${XDG_STATE_HOME:-~/.local/state}/herdr-commander/cursors/` (overridable via `--cursor NAME`, `--no-advance`, `--reset-cursor`), catching `working`/`busy_bg` -> `idle` transitions (`settled_idle`), deduplicating unchanged `revision` ticks via normalized `peek_hash`, omitting unchanged `blocked` re-peeks (`still_blocked`), and reporting `closed_workspaces`.
+- `--compact` defaults `--peek-lines` to `20`, trims statusline/chrome, prefers structured `Status / Summary / Evidence / Blockers / Next` tails, and bounds peek length (`--max-peek-chars`, default `1500`).
+- `--all` includes `working`/`idle`/`shell` Spaces in addition to attention-needed ones; `--include-idle` peeks `idle` agent Spaces; `--workspace` digests a single Space; `--include-self` includes the caller's Space; `--no-verify-busy` / `--no-tracker` disable extra checks; `--peek-lines 0` skips terminal reads.
 
 ### `status`
 
@@ -125,13 +130,27 @@ hcmd peek CBRD-10001 --source visible --json
 
 ### `wait` (opt-in)
 
-Opt-in blocking wait on Herdr socket events until any watched first-tab reaches target states (Commander dispatches asynchronously by default and harvests via `hcmd digest`):
+Opt-in blocking wait on Herdr socket events until watched Spaces match `--until` or emit a delta:
 
 ```bash
 hcmd wait --until blocked,done --timeout 300 --verify-busy --json
+hcmd wait --since-last --include-subtabs --emit-digest --compact --stop-when-idle --allow-timeout --timeout 600 --verify-busy --json
 ```
 
-- Supports `--workspace` to watch a single workspace, `--all-workspaces` to include the caller's own workspace, `--timeout` (default `300`), and `--verify-busy`.
+- Supports `--workspace`, `--all-workspaces`, `--timeout` (default `300`), and `--verify-busy`.
+- Transition/watch flags: `--since-last` / `--changes-only` (ignore already-settled Spaces at startup), `--cursor` / `--no-advance`, `--include-subtabs` (watch sub-tab panes and `sub_tabs.any_blocked`), `--stop-when-idle` (exit immediately with `reason: "no_active_work"` when nothing is active), `--allow-timeout` (exit `0` with `timed_out: true`), `--emit-digest`, `--compact`, `--peek-lines`, `--max-peek-chars`, and `--with-tracker`.
+
+### `self-context` & `rotate`
+
+Inspect the calling pane's context-window usage from its rendered `ay` / `claude` statusline and rotate cleanly inside the same tab when context exceeds threshold:
+
+```bash
+hcmd self-context --rotate-ctx 30 --json
+hcmd rotate --rotate-ctx 30 --cursor auto-watch --json
+hcmd rotate --ack <old_pane_id> --json
+```
+
+- `hcmd rotate` splits the caller's tab (`t1`, preserving `tabs[0]` and all sub-tabs), enforces a 300s cooldown (`--cooldown`, `--force`), saves handoff state under `${XDG_STATE_HOME:-~/.local/state}/herdr-commander/handoff/`, launches the successor agent (`ay` default, dismissing any startup overlay and verifying `working`), and leaves the old pane alive until the successor completes init and runs `hcmd rotate --ack <old_pane_id>`.
 
 ### `ensure`
 
@@ -249,7 +268,10 @@ Business logic stays pure and testable in the Python ≥3.11 standard library, w
 | [`src/herdr_commander/orchestrate.py`](src/herdr_commander/orchestrate.py) | Pure planning and execution for `ensure`, `send`, `wait`, `tab`, and `pane` |
 | [`src/herdr_commander/formatters.py`](src/herdr_commander/formatters.py) | Output mode detection and `human`, `plain`, and `json` renderers |
 | [`src/herdr_commander/cli.py`](src/herdr_commander/cli.py) | CLI entry point; sole module writing to stdout/stderr or exiting |
-| [`skill/herdr-commander/SKILL.md`](skill/herdr-commander/SKILL.md) | Commander orchestration skill linked by `just install-skill` |
+| [`skill/herdr-commander/SKILL.md`](skill/herdr-commander/SKILL.md) | Compatibility wrapper delegating across Commander skills |
+| [`skill/herdr-commander-init/SKILL.md`](skill/herdr-commander-init/SKILL.md) | Canonical bootstrap, dispatch, and `--handoff` resume skill (`hcmd-init` alias) |
+| [`skill/hcmd-check/SKILL.md`](skill/hcmd-check/SKILL.md) | Lean delta harvest and decision-first Korean brief skill |
+| [`skill/hcmd-auto/SKILL.md`](skill/hcmd-auto/SKILL.md) | Event-driven autonomous watch loop, safety allowlist, and self-rotation skill |
 | [`hcmd.just`](hcmd.just) | Parameterless `hcmd` CLI lifecycle and query presets (`just --list hcmd` / `just hcmd <recipe>`) |
 
 ## Development
