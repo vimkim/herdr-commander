@@ -186,12 +186,14 @@ hcmd ensure --cwd ~/gh/my-repo --pwd ~/gh/my-repo --label my-repo --on-existing 
 Validate first-tab readiness and send a prompt (supports `--prompt -` from stdin, opt-in `--wait` with `--timeout` default `120`, and `--dry-run`; default is async fire-and-return):
 
 ```bash
-hcmd send w1 --prompt - --json <<'EOF'
-Summarize your findings in Tab 1.
+hcmd send w1 --kickoff --tracker "#1124" --context "Single writer in this worktree" --prompt - --json <<'EOF'
+Objective: Run targeted tests and report results.
 EOF
+hcmd send w1 --prompt "1. Proceed." --json
 ```
 
-Refuses `blocked` agents (`AGENT_BLOCKED`), `working`/`busy_bg` agents without `--force` (`AGENT_BUSY`), and the caller's own workspace without `--force` (`CANNOT_SEND_TO_SELF`).
+- `--kickoff` (with optional `--tracker <ID>` and repeatable `--context <TEXT>`) prepends the Minimal Commander Context Envelope (Space Lead role, human-in-the-loop Tab 1 note, `hcmd tab` hygiene, external-write boundaries, and `Status / Summary / Evidence / Decision / Next` reporting rule) for initial task dispatch. Omit `--kickoff` on follow-ups to keep prompts raw.
+- Refuses `blocked` agents (`AGENT_BLOCKED`), `working`/`busy_bg` agents without `--force` (`AGENT_BUSY`), and the caller's own workspace without `--force` (`CANNOT_SEND_TO_SELF`).
 
 ## Hierarchy and Guardrails
 

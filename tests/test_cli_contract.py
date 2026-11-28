@@ -895,6 +895,70 @@ class CliContractTests(unittest.TestCase):
                 self.assertFalse(w_data["timed_out"])
                 self.assertEqual(w_data["digest"]["entries"][0]["change_reason"], "subtab_blocked")
 
+    def test_send_kickoff_envelope_and_flag_validation(self) -> None:
+        snapshot = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = Path(tmpdir) / "herdr.sock"
+            with MockHerdrServer(sock_path, snapshot):
+                plain = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "send",
+                        "w2",
+                        "--prompt",
+                        "1. yes",
+                        "--dry-run",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(plain.returncode, 0, plain.stderr)
+                plain_data = json.loads(plain.stdout)["data"]
+                self.assertEqual(plain_data["prompt_chars"], len("1. yes"))
+                self.assertNotIn("kickoff", plain_data)
+
+                kickoff = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "send",
+                        "w2",
+                        "--kickoff",
+                        "--tracker",
+                        "1124",
+                        "--context",
+                        "Use flock",
+                        "--prompt",
+                        "Objective: X",
+                        "--dry-run",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(kickoff.returncode, 0, kickoff.stderr)
+                kickoff_data = json.loads(kickoff.stdout)["data"]
+                self.assertTrue(kickoff_data["kickoff"])
+                self.assertGreater(kickoff_data["prompt_chars"], len("Objective: X"))
+
+                bad = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "send",
+                        "w2",
+                        "--tracker",
+                        "1124",
+                        "--prompt",
+                        "hi",
+                        "--json",
+                    ],
+                    env={"HERDR_WORKSPACE_ID": "w4"},
+                )
+                self.assertEqual(bad.returncode, 2)
+                err = json.loads(bad.stderr.strip().splitlines()[-1])
+                self.assertEqual(err["error"]["code"], "INVALID_FLAGS")
+
 
 if __name__ == "__main__":
     unittest.main()

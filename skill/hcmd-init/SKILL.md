@@ -118,19 +118,18 @@ hcmd ensure --cwd ~/gh/my-project --label my-project-2 --on-existing new --launc
 
 If `ensure` exits with `OCCUPIED_BY_OTHER_AGENT`, inspect the workspace with `hcmd peek <ws>` instead of overwriting the pane.
 
-Send the kickoff brief to Tab 1 via stdin so multiline text needs no shell escaping (never pass `--wait` unless the user explicitly requested blocking):
+Send the kickoff brief to Tab 1 via stdin with `--kickoff` (opt-in on `send`: prepends the Minimal Commander Context Envelope — Space Lead identity, human-in-the-loop Tab 1 note, `hcmd tab` hygiene, external-write boundaries, optional `--tracker`/`--context`, and `Status / Summary / Evidence / Decision / Next` reporting rule). Never pass `--wait` unless the user explicitly requested blocking, and **omit `--kickoff` on ordinary follow-up replies** (keep follow-ups raw via plain `hcmd send`):
 
 ```bash
-hcmd send <ws> --prompt - --json <<'EOF'
+hcmd send <ws> --kickoff --tracker <ID> --context "<guardrail>" --prompt - --json <<'EOF'
 Objective: <concise goal and acceptance criteria>.
-Tracker ID: <work-tracker ID or none>.
-Workspace execution: Use `hcmd tab` inside this workspace for parallel work, builds, tests, or helper agents (up to 8 sub-tabs, short role `--label` such as build, test, review, or ci, `ai-agent` default for AI workers, `--launcher shell` for commands). Keep your own context window lean by delegating substantial, noisy, or exploratory work to sub-tabs or subagents while handling trivial steps directly. Keep same-worktree edits to one agent at a time, and close finished sub-tabs you created with `hcmd tab close`.
-Reporting rule: Keep final findings, verification evidence, and blockers in this first tab. End your final or blocked Tab 1 response with a compact block so Commander can harvest it via `hcmd digest` / `hcmd peek`:
-- Status: <done | blocked>
-- Summary: <1-3 concise bullets>
-- Evidence: <commits, test runs, PR/doc paths>
-- Blockers / Next: <approval/decision needed or none>
 EOF
+```
+
+For ordinary follow-up turns after kickoff, send raw prompts without `--kickoff`:
+
+```bash
+hcmd send <ws> --prompt "1. Proceed with the local test run." --json
 ```
 
 Never pass `--force` to bypass `AGENT_BLOCKED`. Inspect blocked dialogs with `hcmd peek <ws>` and ask the user before answering approval or question prompts.

@@ -15,8 +15,10 @@ from herdr_commander.models import EXIT_CONFIG, EXIT_DOMAIN, EXIT_USAGE, CliErro
 from herdr_commander.orchestrate import (
     LAUNCHERS,
     build_agent_start_args,
+    build_commander_kickoff_envelope,
     build_pane_run_command,
     compact_peek_text,
+    compose_send_prompt,
     detect_startup_overlay,
     execute_digest,
     execute_digest_with_cursor,
@@ -1908,6 +1910,95 @@ class DeltaDigestWaitAndRotateTests(unittest.TestCase):
         self.assertTrue(ack_res.old_pane_closed)
         self.assertEqual(closed_panes, ["w2:p4"])
         self.assertEqual(saved[-1][0]["status"], "completed")
+
+    def test_send_kickoff_envelope_and_raw_followup(self) -> None:
+        raw = load_fixture()
+        spaces = parse_snapshot(raw, self_workspace_id="w4", path_exists=lambda _p: True)
+        target_space = next(s for s in spaces if s.workspace_id == "w2")
+
+        envelope = build_commander_kickoff_envelope(
+            space=target_space,
+            commander_workspace_id="w4",
+            tracker_id="#1124",
+            context_notes=["Use flock on shared cache", "Sibling w1 owns parser"],
+        )
+        env_lines = envelope.splitlines()
+        self.assertLessEqual(len(env_lines), 10)
+        self.assertIn("w2 (demo-skills)", envelope)
+        self.assertIn("Herdr Commander (w4)", envelope)
+        self.assertIn("Human-in-the-loop:", envelope)
+        self.assertIn("hcmd tab", envelope)
+        self.assertIn("Tracker: #1124", envelope)
+        self.assertIn("Context: Use flock on shared cache", envelope)
+        self.assertIn("Context: Sibling w1 owns parser", envelope)
+        self.assertIn("Status / Summary / Evidence / Decision / Next", envelope)
+
+        self.assertEqual(
+            compose_send_prompt("1. yes", space=target_space, kickoff=False),
+            "1. yes",
+        )
+        with self.assertRaises(CliError) as empty_err:
+            compose_send_prompt("   ", space=target_space, kickoff=True)
+        self.assertEqual(empty_err.exception.code, "EMPTY_PROMPT")
+
+        decision_tail = (
+            "Old noise\n"
+            "- Status: blocked\n"
+            "- Summary: Need choice.\n"
+            "- Evidence: test.log\n"
+            "- Decision / Next: Approve option A?\n"
+        )
+        compacted, truncated = compact_peek_text(decision_tail, max_chars=500)
+        self.assertFalse(truncated)
+        self.assertTrue(compacted.startswith("- Status: blocked"))
+        self.assertNotIn("Old noise", compacted)
+
+        class SnapClient:
+            def snapshot(self) -> dict:
+                return raw
+
+            def read_detection(self, _pane_id: str) -> str:
+                return ""
+
+        parser = build_parser()
+        mode = OutputMode("json", False, False, False)
+        sent_prompts: list[str] = []
+
+        def fake_agent_prompt(_pid: str, prompt: str, *, wait: bool = False, timeout_ms=None):
+            sent_prompts.append(prompt)
+            return {}
+
+        ns_plain = parser.parse_args(["send", "w2", "--prompt", "1. yes", "--json"])
+        with patch("herdr_commander.cli.agent_prompt", side_effect=fake_agent_prompt):
+            plain_out = json.loads(_dispatch(ns_plain, SnapClient(), {}, "w4", mode))
+        self.assertEqual(sent_prompts[-1], "1. yes")
+        self.assertNotIn("kickoff", plain_out["data"])
+
+        ns_kickoff = parser.parse_args(
+            [
+                "send",
+                "w2",
+                "--kickoff",
+                "--tracker",
+                "#1124",
+                "--context",
+                "Own file A",
+                "--context",
+                "Use flock",
+                "--prompt",
+                "Objective: run tests",
+                "--json",
+            ]
+        )
+        with patch("herdr_commander.cli.agent_prompt", side_effect=fake_agent_prompt):
+            kick_out = json.loads(_dispatch(ns_kickoff, SnapClient(), {}, "w4", mode))
+        self.assertTrue(kick_out["data"]["kickoff"])
+        self.assertIn("Herdr Commander (w4)", sent_prompts[-1])
+        self.assertIn("w2 (demo-skills)", sent_prompts[-1])
+        self.assertIn("Tracker: #1124", sent_prompts[-1])
+        self.assertIn("Context: Own file A", sent_prompts[-1])
+        self.assertIn("Context: Use flock", sent_prompts[-1])
+        self.assertTrue(sent_prompts[-1].endswith("\n\nObjective: run tests"))
 
 
 if __name__ == "__main__":

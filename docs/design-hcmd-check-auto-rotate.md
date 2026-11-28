@@ -41,6 +41,10 @@
 - Launches successor (`ay` default), sends bootstrap prompt, and verifies `working` status while leaving the retiring pane alive (`status: "pending_ack"`).
 - Successor pane completes `/herdr-commander-init` (`/hcmd-init`), then executes `hcmd rotate --ack <old_pane_id>` — verified against `handoff/<ws>.json` (`CANNOT_ACK_SELF` and `HANDOFF_MISMATCH` guards) before closing the old pane.
 
+### 2.6 Minimal Commander Context Envelope (`hcmd send --kickoff`)
+- `hcmd send --kickoff [--tracker ID] [--context TEXT]...` prepends an 8–10 line envelope for initial Space Lead dispatch: Space Lead (`tabs[0]`) + Commander identity, human-in-the-loop Tab 1 note, `hcmd tab` (max 8) + single-writer hygiene, external-write boundary, optional tracker/context guardrails, and `Status / Summary / Evidence / Decision / Next` reporting rule.
+- Plain `hcmd send` (without `--kickoff`) sends prompts completely raw so ordinary follow-up replies never repeat boilerplate.
+
 ## 3. Skill Layout (`skill/*`)
 
 | Skill | Responsibility |

@@ -86,6 +86,7 @@ from .models import (
 from .orchestrate import (
     LAUNCHERS,
     TrustWorkspaceFn,
+    compose_send_prompt,
     execute_digest_with_cursor,
     execute_ensure,
     execute_pane_close,
@@ -566,6 +567,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--prompt",
         required=True,
         help="Prompt text, or `-` to read from stdin",
+    )
+    p_send.add_argument(
+        "--kickoff",
+        action="store_true",
+        help=(
+            "Prepend Minimal Commander Context Envelope for initial Space Lead dispatch "
+            "(omit on ordinary follow-ups)"
+        ),
+    )
+    p_send.add_argument(
+        "--tracker",
+        default=None,
+        metavar="ID",
+        help="Optional work-tracker ID included in the --kickoff envelope",
+    )
+    p_send.add_argument(
+        "--context",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="Repeatable guardrail note (shared locks, sibling ownership) for --kickoff",
     )
     p_send.add_argument(
         "--wait",
@@ -1465,20 +1487,39 @@ def _dispatch(
                 "Pass e.g. `--timeout 120`.",
                 exit_code=EXIT_USAGE,
             )
-        prompt = _read_prompt_arg(ns.prompt, sys.stdin.isatty())
+        if (ns.tracker is not None or ns.context) and not ns.kickoff:
+            raise CliError(
+                "INVALID_FLAGS",
+                "--tracker and --context require --kickoff.",
+                (
+                    "Add `--kickoff` for initial Space Lead dispatch, "
+                    "or omit `--tracker`/`--context` for plain follow-ups."
+                ),
+                exit_code=EXIT_USAGE,
+            )
+        raw_prompt = _read_prompt_arg(ns.prompt, sys.stdin.isatty())
         spaces = parse_snapshot(client.snapshot(), self_workspace_id=self_workspace_id)
         space = resolve_target(spaces, ns.target)
         if space.primary_pane and space.primary_pane.agent_kind == "claude":
             verified = verify_claude_busy([space], client.read_detection)
             space = verified[0]
+        final_prompt = compose_send_prompt(
+            raw_prompt,
+            space=space,
+            kickoff=bool(ns.kickoff),
+            commander_workspace_id=self_workspace_id,
+            tracker_id=ns.tracker,
+            context_notes=ns.context,
+        )
         result = execute_send(
             space,
-            prompt=prompt,
+            prompt=final_prompt,
             wait=bool(ns.wait),
             timeout=float(ns.timeout),
             force=bool(ns.force),
             dry_run=bool(ns.dry_run),
             prompt_fn=agent_prompt,
+            kickoff=bool(ns.kickoff),
         )
         return format_send(result, mode)
 

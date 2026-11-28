@@ -542,9 +542,23 @@ class SendResult:
     waited: bool
     settled_status: str | None
     prompt_chars: int
+    kickoff: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data: dict[str, Any] = {
+            "dry_run": self.dry_run,
+            "workspace_id": self.workspace_id,
+            "label": self.label,
+            "pane_id": self.pane_id,
+            "agent_kind": self.agent_kind,
+            "agent_status": self.agent_status,
+            "waited": self.waited,
+            "settled_status": self.settled_status,
+            "prompt_chars": self.prompt_chars,
+        }
+        if self.kickoff:
+            data["kickoff"] = True
+        return data
 
 
 @dataclass(frozen=True)

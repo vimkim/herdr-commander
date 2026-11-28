@@ -967,6 +967,78 @@ def validate_send(space: SpaceSnapshot, *, prompt: str, force: bool) -> None:
         )
 
 
+def build_commander_kickoff_envelope(
+    *,
+    space: SpaceSnapshot,
+    commander_workspace_id: str | None = None,
+    tracker_id: str | None = None,
+    context_notes: Sequence[str] = (),
+) -> str:
+    """Build the minimal 6-10 line kickoff envelope prepended by `hcmd send --kickoff`."""
+    commander_ref = commander_workspace_id or "unknown"
+    lines = [
+        "[Herdr Commander Kickoff]",
+        (
+            f"Role: You are the Herdr Space Lead (tabs[0]) of {space.workspace_id} "
+            f"({space.label}), delegated by Herdr Commander ({commander_ref})."
+        ),
+        (
+            "Human-in-the-loop: The user may inspect or reply directly in Tab 1; keep Tab 1 "
+            "summaries self-contained and decision-first for both the user and `hcmd digest`."
+        ),
+        (
+            "Delegation: Use `hcmd tab` (max 8 sub-tabs) for heavy/parallel work, keep "
+            "same-worktree writes single-writer, close created sub-tabs when done, and never "
+            "close `tabs[0]`."
+        ),
+        (
+            "Boundaries: Perform external mutations (GitHub/JIRA/push/merge) only when "
+            "explicitly authorized in the Objective or user reply."
+        ),
+    ]
+    clean_tracker = tracker_id.strip() if tracker_id else ""
+    if clean_tracker:
+        lines.append(f"Tracker: {clean_tracker}")
+    for note in context_notes:
+        clean_note = note.strip()
+        if clean_note:
+            lines.append(f"Context: {clean_note}")
+    lines.append(
+        "Reporting: Persist decisive evidence to files (not screen-only) and end your "
+        "final/blocked Tab 1 response with concise Status / Summary / Evidence / Decision / Next "
+        "(`- Status: <done | blocked>`, `- Summary:`, `- Evidence:`, `- Decision / Next:`)."
+    )
+    return "\n".join(lines)
+
+
+def compose_send_prompt(
+    prompt: str,
+    *,
+    space: SpaceSnapshot,
+    kickoff: bool = False,
+    commander_workspace_id: str | None = None,
+    tracker_id: str | None = None,
+    context_notes: Sequence[str] = (),
+) -> str:
+    """Return raw `prompt` unchanged unless `kickoff=True`, which prepends the envelope."""
+    if not prompt.strip():
+        raise CliError(
+            "EMPTY_PROMPT",
+            "Prompt text cannot be empty.",
+            "Pass non-empty text via --prompt or stdin (`--prompt -`).",
+            exit_code=EXIT_USAGE,
+        )
+    if not kickoff:
+        return prompt
+    envelope = build_commander_kickoff_envelope(
+        space=space,
+        commander_workspace_id=commander_workspace_id,
+        tracker_id=tracker_id,
+        context_notes=context_notes,
+    )
+    return f"{envelope}\n\n{prompt}"
+
+
 def execute_send(
     space: SpaceSnapshot,
     *,
@@ -976,6 +1048,7 @@ def execute_send(
     force: bool,
     dry_run: bool,
     prompt_fn: PromptAgentFn,
+    kickoff: bool = False,
 ) -> SendResult:
     """Validate and send a prompt to a workspace's first-tab agent."""
     validate_send(space, prompt=prompt, force=force)
@@ -994,6 +1067,7 @@ def execute_send(
             waited=wait,
             settled_status=None,
             prompt_chars=len(prompt),
+            kickoff=kickoff,
         )
 
     timeout_ms = int(timeout * 1000) if wait else None
@@ -1009,6 +1083,7 @@ def execute_send(
         waited=wait,
         settled_status=str(settled) if isinstance(settled, str) else None,
         prompt_chars=len(prompt),
+        kickoff=kickoff,
     )
 
 
@@ -2518,7 +2593,7 @@ def compact_peek_text(text: str, *, max_chars: int | None) -> tuple[str, bool]:
     for idx in range(len(lines) - 1, -1, -1):
         if _REPORT_STATUS_TAIL_RE.match(lines[idx]):
             tail_block = "\n".join(lines[idx:])
-            if any(key in tail_block for key in ("Summary:", "Evidence:", "Blockers")):
+            if any(key in tail_block for key in ("Summary:", "Evidence:", "Decision:", "Blockers")):
                 normalized = tail_block
             break
 
