@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .models import EXIT_CONFIG, EXIT_DOMAIN, EXIT_TEMP, CliError
+from .models import EXIT_CONFIG, EXIT_DOMAIN, EXIT_TEMP, CliError, DigestCursor
 
 _EVENT_TYPES = (
     "workspace.created",
@@ -731,6 +731,28 @@ def agent_prompt(
         return {}
 
 
+def agent_send_keys(
+    pane_id: str,
+    keys: Sequence[str],
+    *,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Send logical keys (e.g. `esc`, `ctrl+c`) to an agent pane via `herdr agent send-keys`."""
+    if not keys:
+        return {}
+    args = ["herdr", "agent", "send-keys", pane_id, *keys]
+    raw = _run_subprocess(
+        args,
+        timeout=timeout,
+        error_code="AGENT_SEND_KEYS_FAILED",
+        fix=f"Inspect pane {pane_id} with `hcmd peek`.",
+    )
+    try:
+        return json.loads(raw).get("result", {})
+    except ValueError:
+        return {}
+
+
 def fetch_work_tracker_items(timeout: float = 5.0) -> tuple[list[dict[str, Any]], str | None]:
     """Fetch open work-tracker items, degrading gracefully with a warning if unavailable."""
     if not shutil.which("work-tracker"):
@@ -1035,3 +1057,124 @@ def ensure_trusted_workspace(
         if warn:
             warnings.append(warn)
     return warnings
+
+
+def resolve_state_dir(
+    env: Mapping[str, str],
+    *,
+    home_dir: Path | None = None,
+) -> Path:
+    """Resolve persistent state directory under XDG_STATE_HOME/herdr-commander."""
+    home = home_dir or Path.home()
+    raw_state = env.get("XDG_STATE_HOME", "").strip()
+    base = Path(raw_state).expanduser() if raw_state else (home / ".local" / "state")
+    return base / "herdr-commander"
+
+
+def resolve_cursor_scope(
+    socket_path: str,
+    self_workspace_id: str | None,
+    cursor_name: str | None,
+) -> str:
+    """Resolve safe filename-compatible cursor scope for `digest --since-last` / `wait`."""
+    if cursor_name is not None:
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", cursor_name.strip()).strip("-.")
+        if not cleaned:
+            raise CliError(
+                "INVALID_CURSOR",
+                "Cursor name cannot be empty or punctuation-only.",
+                "Pass an alphanumeric cursor name such as `--cursor commander`.",
+                exit_code=2,
+            )
+        return f"named-{cleaned[:64]}"
+    sock_hash = hashlib.sha256(socket_path.encode("utf-8")).hexdigest()[:10]
+    ws_part = re.sub(r"[^A-Za-z0-9._-]+", "-", (self_workspace_id or "global")).strip("-")
+    return f"auto-{sock_hash}-{ws_part or 'global'}"
+
+
+def resolve_cursor_path(state_dir: Path, scope: str) -> Path:
+    """Return path to a digest cursor JSON file."""
+    return state_dir / "cursors" / f"{scope}.json"
+
+
+def load_digest_cursor(path: Path) -> tuple[DigestCursor | None, str | None]:
+    """Load persisted DigestCursor, degrading gracefully with a warning if corrupt."""
+    if not path.exists():
+        return None, None
+    with _config_file_lock(path):
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return None, f"Could not read digest cursor ({path}): {exc}"
+        if not raw.strip():
+            return None, None
+        try:
+            parsed = json.loads(raw)
+        except ValueError as exc:
+            return None, f"Ignoring corrupt digest cursor ({path}): {exc}"
+        if not isinstance(parsed, dict):
+            return None, f"Ignoring malformed digest cursor ({path}): expected JSON object"
+        return DigestCursor.from_dict(parsed), None
+
+
+def save_digest_cursor(path: Path, cursor: DigestCursor) -> None:
+    """Persist DigestCursor atomically under an advisory lock."""
+    serialized = json.dumps(cursor.to_dict(), indent=2, ensure_ascii=False) + "\n"
+    with _config_file_lock(path):
+        _write_text_atomic(path, serialized, default_mode=0o600)
+
+
+def delete_digest_cursor(path: Path) -> bool:
+    """Delete an existing cursor file safely under lock; return True if removed."""
+    with _config_file_lock(path):
+        if not path.exists():
+            return False
+        path.unlink(missing_ok=True)
+        return True
+
+
+def resolve_handoff_paths(state_dir: Path, workspace_id: str) -> tuple[Path, Path]:
+    """Return `(json_path, md_path)` for a workspace's rotation handoff record."""
+    safe_ws = re.sub(r"[^A-Za-z0-9._-]+", "-", workspace_id.strip()).strip("-") or "default"
+    handoff_dir = state_dir / "handoff"
+    return handoff_dir / f"{safe_ws}.json", handoff_dir / f"{safe_ws}.md"
+
+
+def load_handoff_state(json_path: Path) -> dict[str, Any] | None:
+    """Load persisted rotation handoff JSON payload if present and valid."""
+    if not json_path.exists():
+        return None
+    with _config_file_lock(json_path):
+        try:
+            parsed = json.loads(json_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+
+def save_handoff_state(
+    json_path: Path,
+    md_path: Path,
+    payload: Mapping[str, Any],
+    markdown: str,
+) -> None:
+    """Persist rotation handoff JSON and Markdown atomically under lock."""
+    serialized = json.dumps(dict(payload), indent=2, ensure_ascii=False) + "\n"
+    with _config_file_lock(json_path):
+        _write_text_atomic(json_path, serialized, default_mode=0o600)
+        _write_text_atomic(md_path, markdown, default_mode=0o600)
+
+
+def read_recent_audit_lines(state_dir: Path, limit: int = 10) -> list[str]:
+    """Read the most recent lines from `auto-audit.jsonl` if present."""
+    if limit <= 0:
+        return []
+    audit_path = state_dir / "auto-audit.jsonl"
+    if not audit_path.exists():
+        return []
+    try:
+        raw_lines = audit_path.read_text(encoding="utf-8").splitlines()
+        lines = [line.strip() for line in raw_lines if line.strip()]
+    except OSError:
+        return []
+    return lines[-limit:]

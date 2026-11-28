@@ -47,7 +47,23 @@ _LIVE_ACTIVITY = re.compile(
 )
 _FOOTER_CONTROL = re.compile(r"^\s*(?:⏵⏵|▶▶|⏸|⏵|▶)\s+")
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_CTX_PERCENT_RE = re.compile(
+    r"\b(?:ctx|context(?:\s+window)?)(?:\s*[:=]|\s+(?:[^\d\s%a-zA-Z]+\s*)?)\s*(\d{1,3})\s*%",
+    re.IGNORECASE,
+)
+_CTX_TOKEN_PAIR_RE = re.compile(r"\b(\d+(?:\.\d+)?[kKmMgG]?)\s*/\s*(\d+(?:\.\d+)?[kKmMgG])\b")
+_RATE_LIMIT_RE = re.compile(
+    r"\b(?:gemini-)?(5h|7d)\s+(\d{1,3})%(?:\s*[·•]\s*([0-9dhm]+|now))?",
+    re.IGNORECASE,
+)
+
 _VALID_RAW_STATUSES = frozenset({"working", "blocked", "done", "idle", "unknown"})
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences from terminal text."""
+    return _ANSI_ESCAPE_RE.sub("", text)
 
 
 def extract_ticket_key(*candidates: str | None) -> str | None:
@@ -258,11 +274,18 @@ def parse_snapshot(
                 st = _pane_effective_status(pane, agents_by_pane.get(pid))
                 status_counts[st] = status_counts.get(st, 0) + 1
                 if st == "blocked":
+                    agent = agents_by_pane.get(pid)
+                    rev_raw = (
+                        agent.get("revision")
+                        if agent is not None and agent.get("revision") is not None
+                        else pane.get("revision")
+                    )
                     blocked_panes.append(
                         {
                             "tab_id": tid,
                             "tab_label": tab_label_clean,
                             "pane_id": pid,
+                            "revision": int(rev_raw or 0),
                         }
                     )
 
@@ -1271,3 +1294,149 @@ def find_matching_spaces(
         recommendation=compute_find_recommendation(matches),
         matches=tuple(matches),
     )
+
+
+def has_active_work(spaces: Sequence[SpaceSnapshot]) -> bool:
+    """Return True when any Space has a working/busy_bg primary or sub-tab agent."""
+    for space in spaces:
+        if space.attention == "working":
+            return True
+        if space.primary_pane is not None and space.primary_pane.effective_status in {
+            "working",
+            "busy_bg",
+        }:
+            return True
+        if space.sub_tabs.any_working:
+            return True
+    return False
+
+
+def verify_subtabs_claude_busy(
+    raw_snap: dict[str, Any],
+    spaces: Sequence[SpaceSnapshot],
+    read_detection: Callable[[str], str],
+) -> list[SpaceSnapshot]:
+    """Promote idle/done non-primary Claude panes with background tasks to working in rollups."""
+    updated: list[SpaceSnapshot] = []
+    for space in spaces:
+        if space.sub_tabs.any_working or space.sub_tabs.extra_pane_count == 0:
+            updated.append(space)
+            continue
+        tabs = parse_workspace_tabs(raw_snap, space.workspace_id)
+        primary_pane_id = space.primary_pane.pane_id if space.primary_pane else None
+        status_counts = dict(space.sub_tabs.status_counts)
+        promoted = False
+        for tab in tabs:
+            for pane in tab.panes:
+                if pane.pane_id == primary_pane_id:
+                    continue
+                if pane.agent_kind != "claude" or pane.raw_status not in {"idle", "done"}:
+                    continue
+                try:
+                    verdict = classify_claude_detection(read_detection(pane.pane_id))
+                except (CliError, ValueError, KeyError, TypeError):
+                    verdict = "unverified"
+                if verdict == "claude_busy":
+                    prev_count = status_counts.get(pane.raw_status, 0)
+                    if prev_count > 1:
+                        status_counts[pane.raw_status] = prev_count - 1
+                    elif prev_count == 1:
+                        status_counts.pop(pane.raw_status, None)
+                    status_counts["working"] = status_counts.get("working", 0) + 1
+                    promoted = True
+        if promoted:
+            new_sub = replace(space.sub_tabs, status_counts=status_counts, any_working=True)
+            updated.append(replace(space, sub_tabs=new_sub))
+        else:
+            updated.append(space)
+    return updated
+
+
+def _parse_token_count(raw: str) -> int | None:
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    suffix = cleaned[-1].lower()
+    mult = 1
+    num_part = cleaned
+    if suffix == "k":
+        mult = 1_000
+        num_part = cleaned[:-1]
+    elif suffix == "m":
+        mult = 1_000_000
+        num_part = cleaned[:-1]
+    elif suffix == "g":
+        mult = 1_000_000_000
+        num_part = cleaned[:-1]
+    try:
+        return int(round(float(num_part) * mult))
+    except ValueError:
+        return None
+
+
+def parse_self_context_statusline(text: str) -> dict[str, Any]:
+    """Parse `ay` or `claude` statusline context telemetry from visible/recent pane text."""
+    stripped = strip_ansi(text)
+    matched_line: str | None = None
+    ctx_percent: int | None = None
+    tokens_used: int | None = None
+    tokens_limit: int | None = None
+    tokens_display: str | None = None
+    model_display: str | None = None
+    rate_limits: dict[str, Any] = {}
+
+    for raw_line in reversed(stripped.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        pct_match = _CTX_PERCENT_RE.search(line)
+        tok_match = _CTX_TOKEN_PAIR_RE.search(line)
+        has_pipe_context = "│" in line and (
+            pct_match is not None or tok_match is not None or "5h" in line or "7d" in line
+        )
+        if pct_match is None and not has_pipe_context:
+            continue
+
+        matched_line = line
+        if pct_match is not None:
+            pct_val = int(pct_match.group(1))
+            if 0 <= pct_val <= 100:
+                ctx_percent = pct_val
+
+        if tok_match is not None:
+            tokens_display = f"{tok_match.group(1)}/{tok_match.group(2)}"
+            tokens_used = _parse_token_count(tok_match.group(1))
+            tokens_limit = _parse_token_count(tok_match.group(2))
+            if (
+                ctx_percent is None
+                and tokens_used is not None
+                and tokens_limit
+                and tokens_limit > 0
+            ):
+                ctx_percent = max(0, min(100, int(round((tokens_used / tokens_limit) * 100))))
+
+        if "│" in line:
+            first_seg = line.split("│", 1)[0].strip()
+            if first_seg:
+                model_display = first_seg
+
+        for rl_match in _RATE_LIMIT_RE.finditer(line):
+            window = rl_match.group(1).lower()
+            rem = int(rl_match.group(2))
+            entry: dict[str, Any] = {"remaining_percent": rem}
+            if rl_match.group(3):
+                entry["resets_in"] = rl_match.group(3)
+            rate_limits[window] = entry
+        break
+
+    parsed = matched_line is not None and ctx_percent is not None
+    return {
+        "parsed": parsed,
+        "model_display": model_display,
+        "ctx_percent": ctx_percent,
+        "tokens_used": tokens_used,
+        "tokens_limit": tokens_limit,
+        "tokens_display": tokens_display,
+        "rate_limits": rate_limits,
+        "statusline": matched_line,
+    }

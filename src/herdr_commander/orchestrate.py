@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shlex
@@ -12,16 +13,21 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .models import (
+    DEFAULT_MAX_PEEK_CHARS,
     DEFAULT_MAX_SESSION_AGENTS,
     DEFAULT_MAX_SPACE_AGENTS,
     DEFAULT_MAX_SUB_TABS,
     DEFAULT_MAX_WORKER_PANES,
+    DEFAULT_ROTATE_COOLDOWN,
+    DEFAULT_ROTATE_CTX,
     EXIT_DOMAIN,
     EXIT_USAGE,
     VALID_ON_EXISTING_POLICIES,
     VALID_SPLIT_DIRECTIONS,
     CallerContext,
     CliError,
+    DigestCursor,
+    DigestCursorEntry,
     DigestEntry,
     DigestPeek,
     DigestResult,
@@ -32,6 +38,7 @@ from .models import (
     PaneSpawnPlan,
     PaneSpawnResult,
     PaneWaitResult,
+    RotateResult,
     SendResult,
     SpaceSnapshot,
     TabCloseResult,
@@ -44,21 +51,41 @@ from .models import (
 from .snapshot import (
     collect_live_agent_names,
     compute_find_recommendation,
+    correlate_work_tracker,
     count_session_working_agents,
     count_workspace_non_primary_agents,
     find_matching_spaces,
+    has_active_work,
     is_primary_exact_match,
     parse_snapshot,
     parse_workspace_tabs,
     resolve_pane_target,
     resolve_tab_target,
     resolve_target,
+    strip_ansi,
     strip_tab_decorations,
     verify_claude_busy,
     verify_panes_claude_busy,
+    verify_subtabs_claude_busy,
 )
 
 _CLAUDE_ENV_VARS = ("CLAUDE_ACCOUNTS_DIR", "CLAUDE_CONFIG_DIR", "XDG_STATE_HOME")
+
+_STATUSLINE_FOOTER_RE = re.compile(
+    r"│.*(?:\bctx\b|(?:gemini-)?5h\s+\d+%|\b7d\s+\d+%|\bLow allowance\b)",
+    re.IGNORECASE,
+)
+_BOX_RULE_LINE_RE = re.compile(r"^\s*[─━═-]{3,}\s*$")
+_EMPTY_PROMPT_LINE_RE = re.compile(r"^\s*[>❯]\s*$")
+_REPORT_STATUS_TAIL_RE = re.compile(
+    r"^\s*[-*]?\s*Status:\s*(?:done|blocked)\b",
+    re.IGNORECASE,
+)
+_OVERLAY_PATTERNS = (
+    re.compile(r"\besc\s+to\s+dismiss\b", re.IGNORECASE),
+    re.compile(r"\bpress\s+esc(?:ape)?\s+to\s+(?:dismiss|close|continue)\b", re.IGNORECASE),
+    re.compile(r"\bintroducing\s+gemini\b", re.IGNORECASE),
+)
 
 
 class SnapshotClient(Protocol):
@@ -186,6 +213,12 @@ class ReadPaneFn(Protocol):
         source: str = "recent-unwrapped",
         lines: int = 40,
     ) -> dict[str, Any]: ...
+
+
+class SendKeysFn(Protocol):
+    """Callback matching `herdr_client.agent_send_keys`."""
+
+    def __call__(self, pane_id: str, keys: Sequence[str]) -> dict[str, Any]: ...
 
 
 class TrustWorkspaceFn(Protocol):
@@ -636,6 +669,8 @@ def execute_ensure(
     env: Mapping[str, str],
     select_backend: SelectBackendFn | None = None,
     trust_workspace: TrustWorkspaceFn | None = None,
+    read_pane: ReadPaneFn | None = None,
+    send_keys: SendKeysFn | None = None,
     self_workspace_id: str | None = None,
     dry_run: bool = False,
     ready_timeout: float = 45.0,
@@ -742,6 +777,8 @@ def execute_ensure(
         timeout=ready_timeout,
         poll_interval=poll_interval,
         sleep_fn=sleep_fn,
+        read_pane=read_pane,
+        send_keys=send_keys,
     )
     return _build_ensure_result(plan, settled, agent_action="launch")
 
@@ -772,6 +809,41 @@ def _locate_ensured_space(
     return found.matches[0].space if found.matches else None
 
 
+def detect_startup_overlay(text: str) -> bool:
+    """Return True when terminal text shows a dismissible startup overlay (e.g. `ay` banner)."""
+    cleaned = strip_ansi(text)
+    return any(pattern.search(cleaned) for pattern in _OVERLAY_PATTERNS)
+
+
+def _dismiss_startup_overlay_if_present(
+    *,
+    pane_id: str,
+    agent_kind: str | None,
+    read_pane: ReadPaneFn | None,
+    send_keys: SendKeysFn | None,
+    sleep_fn: Callable[[float], None],
+    max_attempts: int = 2,
+) -> bool:
+    """Dismiss an `ay` startup overlay (`esc to dismiss`) if visible before prompting."""
+    if agent_kind != "agy" or read_pane is None or send_keys is None:
+        return False
+    dismissed = False
+    for _ in range(max_attempts):
+        try:
+            read = read_pane(pane_id, has_agent=True, source="visible", lines=25)
+        except CliError:
+            break
+        if not detect_startup_overlay(str(read.get("text") or "")):
+            break
+        try:
+            send_keys(pane_id, ("esc",))
+        except CliError:
+            break
+        dismissed = True
+        sleep_fn(0.4)
+    return dismissed
+
+
 def _wait_for_launched_agent(
     *,
     client: SnapshotClient,
@@ -781,6 +853,8 @@ def _wait_for_launched_agent(
     timeout: float,
     poll_interval: float,
     sleep_fn: Callable[[float], None],
+    read_pane: ReadPaneFn | None = None,
+    send_keys: SendKeysFn | None = None,
 ) -> SpaceSnapshot:
     deadline = time.monotonic() + timeout
     expected_label = " or ".join(expected_agents)
@@ -803,6 +877,13 @@ def _wait_for_launched_agent(
                         details={"workspace_id": workspace_id, "pane_id": pane.pane_id},
                     )
                 if pane.interactive_ready or pane.raw_status in {"idle", "done"}:
+                    _dismiss_startup_overlay_if_present(
+                        pane_id=pane.pane_id,
+                        agent_kind=pane.agent_kind,
+                        read_pane=read_pane,
+                        send_keys=send_keys,
+                        sleep_fn=sleep_fn,
+                    )
                     return space
         if time.monotonic() >= deadline:
             raise CliError(
@@ -955,6 +1036,37 @@ def match_wait_targets(
     return watched, matched
 
 
+def _collect_watched_pane_ids(
+    raw_snap: dict[str, Any],
+    watched_spaces: Sequence[SpaceSnapshot],
+    *,
+    include_subtabs: bool,
+) -> list[str]:
+    if not include_subtabs:
+        return [s.primary_pane.pane_id for s in watched_spaces if s.primary_pane is not None]
+    watched_ids = {s.workspace_id for s in watched_spaces}
+    pane_ids: list[str] = []
+    for wid in watched_ids:
+        for tab in parse_workspace_tabs(raw_snap, wid):
+            for pane in tab.panes:
+                pane_ids.append(pane.pane_id)
+    return pane_ids
+
+
+def _is_self_pane_update_event(event: Mapping[str, Any], self_workspace_id: str | None) -> bool:
+    if not self_workspace_id:
+        return False
+    ev_type = event.get("event") or event.get("type") or ""
+    if ev_type != "pane.updated":
+        return False
+    data = event.get("data") if isinstance(event.get("data"), Mapping) else event
+    ev_ws = data.get("workspace_id")
+    ev_pane = data.get("pane_id")
+    if ev_ws == self_workspace_id:
+        return True
+    return isinstance(ev_pane, str) and ev_pane.startswith(f"{self_workspace_id}:")
+
+
 def execute_wait(
     *,
     client: WaitClient,
@@ -966,41 +1078,297 @@ def execute_wait(
     self_workspace_id: str | None,
 ) -> WaitResult:
     """Wait via Herdr socket events until any watched first-tab reaches target state."""
+    result, _cursor, _warnings = execute_wait_with_cursor(
+        client=client,
+        until=until,
+        workspace=workspace,
+        workers_only=workers_only,
+        timeout=timeout,
+        verify_busy=verify_busy,
+        self_workspace_id=self_workspace_id,
+    )
+    return result
+
+
+def execute_wait_with_cursor(
+    *,
+    client: WaitClient,
+    until: Sequence[str],
+    workspace: str | None,
+    workers_only: bool,
+    timeout: float,
+    verify_busy: bool,
+    self_workspace_id: str | None,
+    since_last: bool = False,
+    prev_cursor: DigestCursor | None = None,
+    cursor_scope: str = "default",
+    changes_only: bool = False,
+    include_subtabs: bool = False,
+    stop_when_idle: bool = False,
+    allow_timeout: bool = False,
+    emit_digest: bool = False,
+    compact: bool = False,
+    peek_lines: int = 40,
+    peek_source: str = "recent-unwrapped",
+    max_peek_chars: int | None = None,
+    read_pane: ReadPaneFn | None = None,
+    tracker_items: Sequence[dict[str, Any]] | None = None,
+    debounce_seconds: float = 0.25,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> tuple[WaitResult, DigestCursor | None, list[str]]:
+    """Wait via Herdr socket events with optional delta cursor, sub-tab watch, and digest."""
     start = time.monotonic()
     deadline = start + timeout
     until_tuple = tuple(until)
     until_set = frozenset(until_tuple)
+    warnings: list[str] = []
+    delta_mode = bool(since_last or changes_only)
+    effective_read_pane: ReadPaneFn = read_pane or (lambda pid, **_kw: {"pane_id": pid, "text": ""})
+    effective_peek_lines = peek_lines if (emit_digest or read_pane is not None) else 0
 
-    def evaluate() -> tuple[list[SpaceSnapshot], list[SpaceSnapshot]]:
-        spaces = parse_snapshot(client.snapshot(), self_workspace_id=self_workspace_id)
+    def evaluate_spaces() -> tuple[dict[str, Any], list[SpaceSnapshot], list[SpaceSnapshot]]:
+        raw_snap = client.snapshot()
+        spaces = parse_snapshot(raw_snap, self_workspace_id=self_workspace_id)
         if verify_busy:
             spaces = verify_claude_busy(spaces, client.read_detection)
-        return match_wait_targets(
+            if include_subtabs or stop_when_idle:
+                spaces = verify_subtabs_claude_busy(raw_snap, spaces, client.read_detection)
+        if tracker_items:
+            spaces = correlate_work_tracker(spaces, tracker_items)
+        watched, matched = match_wait_targets(
             spaces,
             until=until_set,
             workspace=workspace,
             workers_only=workers_only,
         )
+        if include_subtabs and "blocked" in until_set:
+            matched_ids = {s.workspace_id for s in matched}
+            for space in watched:
+                if space.sub_tabs.any_blocked and space.workspace_id not in matched_ids:
+                    matched.append(space)
+                    matched_ids.add(space.workspace_id)
+        return raw_snap, watched, matched
 
-    watched, matched = evaluate()
-    if matched:
-        return WaitResult(
-            until=until_tuple,
-            matched=tuple(matched),
-            elapsed_seconds=time.monotonic() - start,
-            from_initial_snapshot=True,
+    def build_digest_for_spaces(
+        watched: Sequence[SpaceSnapshot],
+        baseline: DigestCursor | None,
+        *,
+        force_since_last: bool,
+    ) -> tuple[DigestResult, DigestCursor]:
+        res, next_cur, warn_list = execute_digest_with_cursor(
+            watched,
+            read_pane=effective_read_pane,
+            include_all=False,
+            include_idle=False,
+            workspace=workspace,
+            peek_lines=effective_peek_lines,
+            peek_source=peek_source,
+            compact=compact,
+            max_peek_chars=max_peek_chars,
+            since_last=force_since_last,
+            prev_cursor=baseline,
+            cursor_scope=cursor_scope,
         )
+        warnings.extend(warn_list)
+        return res, next_cur
 
-    pane_ids = [s.primary_pane.pane_id for s in watched if s.primary_pane is not None]
-    for _event in client.subscribe_events(pane_ids, deadline=deadline):
-        watched, matched = evaluate()
+    raw_snap, watched, matched = evaluate_spaces()
+    active_cursor: DigestCursor | None = prev_cursor
+
+    if delta_mode:
+        if since_last and prev_cursor is not None:
+            digest_res, next_cur = build_digest_for_spaces(
+                watched, prev_cursor, force_since_last=True
+            )
+            if digest_res.changed:
+                changed_spaces = tuple(entry.space for entry in digest_res.entries)
+                return (
+                    WaitResult(
+                        until=until_tuple,
+                        matched=changed_spaces,
+                        elapsed_seconds=time.monotonic() - start,
+                        from_initial_snapshot=True,
+                        reason="changed",
+                        timed_out=False,
+                        digest=digest_res if emit_digest else None,
+                    ),
+                    next_cur,
+                    warnings,
+                )
+            active_cursor = next_cur
+        else:
+            # Establish initial baseline without firing on already-settled workspaces.
+            _, active_cursor = build_digest_for_spaces(watched, None, force_since_last=True)
+
+        if stop_when_idle and not has_active_work(watched):
+            idle_digest = None
+            if emit_digest:
+                idle_digest = DigestResult(
+                    total_workspaces=len(watched),
+                    counts={},
+                    sub_tabs_blocked_count=sum(1 for s in watched if s.sub_tabs.any_blocked),
+                    entries=(),
+                    peek_lines=effective_peek_lines,
+                    include_all=False,
+                    has_active_work=False,
+                    since_last=since_last,
+                    changed=False,
+                    compact=compact,
+                    cursor_scope=cursor_scope if since_last else None,
+                )
+            return (
+                WaitResult(
+                    until=until_tuple,
+                    matched=(),
+                    elapsed_seconds=time.monotonic() - start,
+                    from_initial_snapshot=True,
+                    reason="no_active_work",
+                    timed_out=False,
+                    digest=idle_digest,
+                ),
+                active_cursor,
+                warnings,
+            )
+    else:
         if matched:
-            return WaitResult(
+            digest_res = None
+            if emit_digest:
+                digest_res, active_cursor = build_digest_for_spaces(
+                    watched, prev_cursor, force_since_last=since_last
+                )
+            return (
+                WaitResult(
+                    until=until_tuple,
+                    matched=tuple(matched),
+                    elapsed_seconds=time.monotonic() - start,
+                    from_initial_snapshot=True,
+                    reason="matched",
+                    timed_out=False,
+                    digest=digest_res,
+                ),
+                active_cursor,
+                warnings,
+            )
+        if stop_when_idle and not has_active_work(watched):
+            return (
+                WaitResult(
+                    until=until_tuple,
+                    matched=(),
+                    elapsed_seconds=time.monotonic() - start,
+                    from_initial_snapshot=True,
+                    reason="no_active_work",
+                    timed_out=False,
+                    digest=None,
+                ),
+                active_cursor,
+                warnings,
+            )
+
+    pane_ids = _collect_watched_pane_ids(raw_snap, watched, include_subtabs=include_subtabs)
+    last_pane_update_eval = 0.0
+    for event in client.subscribe_events(pane_ids, deadline=deadline):
+        if _is_self_pane_update_event(event, self_workspace_id):
+            continue
+        ev_type = event.get("event") or event.get("type") or ""
+        if ev_type == "pane.updated" and debounce_seconds > 0:
+            now_mono = time.monotonic()
+            since_eval = now_mono - last_pane_update_eval
+            if last_pane_update_eval > 0.0 and since_eval < debounce_seconds:
+                remaining_wait = min(debounce_seconds - since_eval, max(0.0, deadline - now_mono))
+                if remaining_wait > 0:
+                    sleep_fn(remaining_wait)
+            last_pane_update_eval = time.monotonic()
+
+        raw_snap, watched, matched = evaluate_spaces()
+        if delta_mode:
+            digest_res, next_cur = build_digest_for_spaces(
+                watched, active_cursor, force_since_last=True
+            )
+            if digest_res.changed:
+                changed_spaces = tuple(entry.space for entry in digest_res.entries)
+                return (
+                    WaitResult(
+                        until=until_tuple,
+                        matched=changed_spaces,
+                        elapsed_seconds=time.monotonic() - start,
+                        from_initial_snapshot=False,
+                        reason="changed",
+                        timed_out=False,
+                        digest=digest_res if emit_digest else None,
+                    ),
+                    next_cur,
+                    warnings,
+                )
+            active_cursor = next_cur
+            if stop_when_idle and not has_active_work(watched):
+                return (
+                    WaitResult(
+                        until=until_tuple,
+                        matched=(),
+                        elapsed_seconds=time.monotonic() - start,
+                        from_initial_snapshot=False,
+                        reason="no_active_work",
+                        timed_out=False,
+                        digest=digest_res if emit_digest else None,
+                    ),
+                    active_cursor,
+                    warnings,
+                )
+        else:
+            if matched:
+                digest_res = None
+                if emit_digest:
+                    digest_res, active_cursor = build_digest_for_spaces(
+                        watched, active_cursor, force_since_last=since_last
+                    )
+                return (
+                    WaitResult(
+                        until=until_tuple,
+                        matched=tuple(matched),
+                        elapsed_seconds=time.monotonic() - start,
+                        from_initial_snapshot=False,
+                        reason="matched",
+                        timed_out=False,
+                        digest=digest_res,
+                    ),
+                    active_cursor,
+                    warnings,
+                )
+            if stop_when_idle and not has_active_work(watched):
+                return (
+                    WaitResult(
+                        until=until_tuple,
+                        matched=(),
+                        elapsed_seconds=time.monotonic() - start,
+                        from_initial_snapshot=False,
+                        reason="no_active_work",
+                        timed_out=False,
+                        digest=None,
+                    ),
+                    active_cursor,
+                    warnings,
+                )
+
+    if allow_timeout:
+        timeout_digest = None
+        if emit_digest:
+            _, watched, _ = evaluate_spaces()
+            timeout_digest, active_cursor = build_digest_for_spaces(
+                watched, active_cursor, force_since_last=delta_mode or since_last
+            )
+        return (
+            WaitResult(
                 until=until_tuple,
-                matched=tuple(matched),
+                matched=(),
                 elapsed_seconds=time.monotonic() - start,
                 from_initial_snapshot=False,
-            )
+                reason="timeout",
+                timed_out=True,
+                digest=timeout_digest,
+            ),
+            active_cursor,
+            warnings,
+        )
 
     raise CliError(
         "WAIT_TIMEOUT",
@@ -1080,6 +1448,8 @@ def _wait_for_pane_agent(
     timeout: float,
     poll_interval: float,
     sleep_fn: Callable[[float], None],
+    read_pane: ReadPaneFn | None = None,
+    send_keys: SendKeysFn | None = None,
 ) -> PaneInfo:
     deadline = time.monotonic() + timeout
     expected_label = " or ".join(expected_agents)
@@ -1097,6 +1467,13 @@ def _wait_for_pane_agent(
                     details={"workspace_id": workspace_id, "pane_id": pane.pane_id},
                 )
             if pane.interactive_ready or pane.raw_status in {"idle", "done"}:
+                _dismiss_startup_overlay_if_present(
+                    pane_id=pane.pane_id,
+                    agent_kind=pane.agent_kind,
+                    read_pane=read_pane,
+                    send_keys=send_keys,
+                    sleep_fn=sleep_fn,
+                )
                 return pane
         if time.monotonic() >= deadline:
             raise CliError(
@@ -1121,6 +1498,8 @@ def _launch_agent_in_pane(
     ready_timeout: float,
     poll_interval: float,
     sleep_fn: Callable[[float], None],
+    read_pane: ReadPaneFn | None = None,
+    send_keys: SendKeysFn | None = None,
 ) -> PaneInfo | None:
     if spec.mode == "agent_start":
         assert spec.agent_kind is not None
@@ -1144,6 +1523,114 @@ def _launch_agent_in_pane(
         timeout=ready_timeout,
         poll_interval=poll_interval,
         sleep_fn=sleep_fn,
+        read_pane=read_pane,
+        send_keys=send_keys,
+    )
+
+
+def _send_kickoff_prompt_verified(
+    *,
+    workspace_id: str,
+    pane_id: str,
+    agent_kind: str | None,
+    initial_revision: int,
+    prompt: str,
+    prompt_fn: PromptAgentFn,
+    client: SnapshotClient,
+    read_pane: ReadPaneFn | None = None,
+    send_keys: SendKeysFn | None = None,
+    verify_started: bool = False,
+    verify_timeout: float = 5.0,
+    poll_interval: float = 0.4,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    self_tab_id: str | None = None,
+    self_pane_id: str | None = None,
+) -> PaneInfo | None:
+    """Send a kickoff prompt, dismissing `ay` overlays and retrying once if swallowed."""
+    if agent_kind == "agy":
+        _dismiss_startup_overlay_if_present(
+            pane_id=pane_id,
+            agent_kind=agent_kind,
+            read_pane=read_pane,
+            send_keys=send_keys,
+            sleep_fn=sleep_fn,
+        )
+
+    def poll_accepted(pre_rev: int) -> tuple[PaneInfo | None, bool]:
+        deadline = time.monotonic() + verify_timeout
+        last_pane: PaneInfo | None = None
+        while True:
+            pane = _find_pane_in_workspace(
+                client.snapshot(),
+                workspace_id,
+                pane_id,
+                self_tab_id=self_tab_id,
+                self_pane_id=self_pane_id,
+            )
+            if pane is not None:
+                last_pane = pane
+                if pane.raw_status in {"working", "blocked", "done"}:
+                    return pane, True
+                if pane.revision > pre_rev:
+                    if read_pane is not None and agent_kind == "agy":
+                        try:
+                            vis = str(
+                                read_pane(pane_id, has_agent=True, source="visible", lines=25).get(
+                                    "text"
+                                )
+                                or ""
+                            )
+                        except CliError:
+                            vis = ""
+                        if not detect_startup_overlay(vis):
+                            return pane, True
+                    else:
+                        return pane, True
+            if time.monotonic() >= deadline:
+                return last_pane, False
+            sleep_fn(poll_interval)
+
+    prompt_fn(pane_id, prompt, wait=False)
+    if not verify_started:
+        return _find_pane_in_workspace(
+            client.snapshot(),
+            workspace_id,
+            pane_id,
+            self_tab_id=self_tab_id,
+            self_pane_id=self_pane_id,
+        )
+
+    pane_after, accepted = poll_accepted(initial_revision)
+    if accepted:
+        return pane_after
+
+    # Prompt may have been swallowed by a late startup overlay on `ay`; dismiss and retry once.
+    if agent_kind == "agy":
+        _dismiss_startup_overlay_if_present(
+            pane_id=pane_id,
+            agent_kind=agent_kind,
+            read_pane=read_pane,
+            send_keys=send_keys,
+            sleep_fn=sleep_fn,
+        )
+    retry_rev = pane_after.revision if pane_after is not None else initial_revision
+    prompt_fn(pane_id, prompt, wait=False)
+    pane_after, accepted = poll_accepted(retry_rev)
+    if accepted:
+        return pane_after
+
+    raise CliError(
+        "PROMPT_NOT_ACCEPTED",
+        (
+            f"Kickoff prompt was not accepted by {agent_kind or 'agent'} in {pane_id} "
+            "(pane remained idle)."
+        ),
+        f"Inspect pane {pane_id} with `hcmd peek` and resend manually.",
+        details={
+            "workspace_id": workspace_id,
+            "pane_id": pane_id,
+            "agent_kind": agent_kind,
+        },
     )
 
 
@@ -1351,9 +1838,12 @@ def execute_tab_spawn(
     env: Mapping[str, str],
     select_backend: SelectBackendFn | None = None,
     trust_workspace: TrustWorkspaceFn | None = None,
+    read_pane: ReadPaneFn | None = None,
+    send_keys: SendKeysFn | None = None,
     dry_run: bool = False,
     ready_timeout: float = 45.0,
     poll_interval: float = 0.5,
+    verify_timeout: float = 5.0,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> TabSpawnResult:
     """Execute a validated TabSpawnPlan."""
@@ -1416,12 +1906,33 @@ def execute_tab_spawn(
         ready_timeout=ready_timeout,
         poll_interval=poll_interval,
         sleep_fn=sleep_fn,
+        read_pane=read_pane,
+        send_keys=send_keys,
     )
     prompt_sent = False
     if plan.prompt and plan.prompt.strip():
-        prompt_fn(pane_id, plan.prompt, wait=False)
+        pane_kind = pane.agent_kind if pane else predicted_agent
+        pane = (
+            _send_kickoff_prompt_verified(
+                workspace_id=plan.workspace_id,
+                pane_id=pane_id,
+                agent_kind=pane_kind,
+                initial_revision=pane.revision if pane else 0,
+                prompt=plan.prompt,
+                prompt_fn=prompt_fn,
+                client=client,
+                read_pane=read_pane,
+                send_keys=send_keys,
+                verify_started=(
+                    pane_kind == "agy" and (read_pane is not None or send_keys is not None)
+                ),
+                verify_timeout=verify_timeout,
+                poll_interval=min(0.4, poll_interval) if poll_interval > 0 else 0.4,
+                sleep_fn=sleep_fn,
+            )
+            or pane
+        )
         prompt_sent = True
-        pane = _find_pane_in_workspace(client.snapshot(), plan.workspace_id, pane_id) or pane
 
     return TabSpawnResult(
         dry_run=False,
@@ -1719,9 +2230,12 @@ def execute_pane_spawn(
     env: Mapping[str, str],
     select_backend: SelectBackendFn | None = None,
     trust_workspace: TrustWorkspaceFn | None = None,
+    read_pane: ReadPaneFn | None = None,
+    send_keys: SendKeysFn | None = None,
     dry_run: bool = False,
     ready_timeout: float = 45.0,
     poll_interval: float = 0.5,
+    verify_timeout: float = 5.0,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> PaneSpawnResult:
     """Execute a validated PaneSpawnPlan."""
@@ -1789,12 +2303,33 @@ def execute_pane_spawn(
         ready_timeout=ready_timeout,
         poll_interval=poll_interval,
         sleep_fn=sleep_fn,
+        read_pane=read_pane,
+        send_keys=send_keys,
     )
     prompt_sent = False
     if plan.prompt and plan.prompt.strip():
-        prompt_fn(pane_id, plan.prompt, wait=False)
+        pane_kind = pane.agent_kind if pane else predicted_agent
+        pane = (
+            _send_kickoff_prompt_verified(
+                workspace_id=plan.workspace_id,
+                pane_id=pane_id,
+                agent_kind=pane_kind,
+                initial_revision=pane.revision if pane else 0,
+                prompt=plan.prompt,
+                prompt_fn=prompt_fn,
+                client=client,
+                read_pane=read_pane,
+                send_keys=send_keys,
+                verify_started=(
+                    pane_kind == "agy" and (read_pane is not None or send_keys is not None)
+                ),
+                verify_timeout=verify_timeout,
+                poll_interval=min(0.4, poll_interval) if poll_interval > 0 else 0.4,
+                sleep_fn=sleep_fn,
+            )
+            or pane
+        )
         prompt_sent = True
-        pane = _find_pane_in_workspace(client.snapshot(), plan.workspace_id, pane_id) or pane
 
     return PaneSpawnResult(
         dry_run=False,
@@ -1950,6 +2485,82 @@ def execute_pane_close(
     )
 
 
+def normalize_peek_text(text: str) -> str:
+    """Normalize pane output by removing ANSI escapes and volatile footer/chrome lines."""
+    cleaned = strip_ansi(text)
+    lines = [line.rstrip() for line in cleaned.splitlines()]
+    lines = [line for line in lines if not _STATUSLINE_FOOTER_RE.search(line)]
+    while lines and (
+        not lines[-1].strip()
+        or _BOX_RULE_LINE_RE.match(lines[-1])
+        or _EMPTY_PROMPT_LINE_RE.match(lines[-1])
+    ):
+        lines.pop()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    return "\n".join(lines)
+
+
+def hash_peek_text(text: str) -> str:
+    """Return deterministic 16-hex digest of normalized pane output."""
+    normalized = normalize_peek_text(text)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def compact_peek_text(text: str, *, max_chars: int | None) -> tuple[str, bool]:
+    """Extract clean reporting tail (if present) and bound length to `max_chars`."""
+    normalized = normalize_peek_text(text)
+    if not normalized:
+        return "", False
+
+    lines = normalized.splitlines()
+    # Prefer the structured Commander reporting block near the tail when present.
+    for idx in range(len(lines) - 1, -1, -1):
+        if _REPORT_STATUS_TAIL_RE.match(lines[idx]):
+            tail_block = "\n".join(lines[idx:])
+            if any(key in tail_block for key in ("Summary:", "Evidence:", "Blockers")):
+                normalized = tail_block
+            break
+
+    if max_chars is not None and max_chars > 0 and len(normalized) > max_chars:
+        prefix = "...(truncated)...\n"
+        if max_chars <= len(prefix) + 8:
+            return normalized[-max_chars:], True
+        keep = max_chars - len(prefix)
+        return prefix + normalized[-keep:], True
+    return normalized, False
+
+
+def _make_digest_peek(
+    *,
+    tab_id: str,
+    tab_label: str,
+    pane_id: str,
+    agent_kind: str | None,
+    agent_status: str,
+    is_primary: bool,
+    lines: int,
+    raw_text: str,
+    compact: bool,
+    max_chars: int | None,
+) -> DigestPeek:
+    if compact or max_chars is not None:
+        text, truncated = compact_peek_text(raw_text, max_chars=max_chars)
+    else:
+        text, truncated = raw_text, False
+    return DigestPeek(
+        tab_id=tab_id,
+        tab_label=tab_label,
+        pane_id=pane_id,
+        agent_kind=agent_kind,
+        agent_status=agent_status,
+        is_primary=is_primary,
+        lines=lines,
+        text=text,
+        truncated=truncated,
+    )
+
+
 def execute_digest(
     spaces: Sequence[SpaceSnapshot],
     *,
@@ -1960,6 +2571,35 @@ def execute_digest(
     peek_source: str = "recent-unwrapped",
 ) -> tuple[DigestResult, list[str]]:
     """Build a non-blocking status digest and harvest attention/target pane snippets."""
+    result, _cursor, warnings = execute_digest_with_cursor(
+        spaces,
+        read_pane=read_pane,
+        include_all=include_all,
+        workspace=workspace,
+        peek_lines=peek_lines,
+        peek_source=peek_source,
+        since_last=False,
+    )
+    return result, warnings
+
+
+def execute_digest_with_cursor(
+    spaces: Sequence[SpaceSnapshot],
+    *,
+    read_pane: ReadPaneFn,
+    include_all: bool = False,
+    include_idle: bool = False,
+    workspace: str | None = None,
+    peek_lines: int = 40,
+    peek_source: str = "recent-unwrapped",
+    compact: bool = False,
+    max_peek_chars: int | None = None,
+    since_last: bool = False,
+    prev_cursor: DigestCursor | None = None,
+    cursor_scope: str = "default",
+    now: float | None = None,
+) -> tuple[DigestResult, DigestCursor, list[str]]:
+    """Build a non-blocking digest with optional delta cursor deduplication and compact peeks."""
     counts: dict[str, int] = {}
     sub_tabs_blocked_count = 0
     for space in spaces:
@@ -1967,28 +2607,190 @@ def execute_digest(
         if space.sub_tabs.any_blocked:
             sub_tabs_blocked_count += 1
 
+    active_work = has_active_work(spaces)
+    max_chars = (
+        max_peek_chars
+        if max_peek_chars is not None
+        else (DEFAULT_MAX_PEEK_CHARS if compact else None)
+    )
+    prev_map = prev_cursor.entries_map() if prev_cursor is not None else {}
+
     entries: list[DigestEntry] = []
     warnings: list[str] = []
+    still_blocked: list[dict[str, str]] = []
+    next_cursor_entries: dict[str, DigestCursorEntry] = {}
+
     for space in spaces:
-        needs_attention = space.attention in {"blocked", "done"} or space.sub_tabs.any_blocked
-        if not include_all and workspace is None and not needs_attention:
-            continue
+        pane = space.primary_pane
+        curr_pane_id = pane.pane_id if pane else None
+        curr_agent_kind = pane.agent_kind if pane else None
+        curr_raw = pane.raw_status if pane else "unknown"
+        curr_eff = pane.effective_status if pane else space.attention
+        curr_rev = pane.revision if pane else 0
+        is_idle_agent = space.attention == "idle" and curr_agent_kind is not None
+        is_settled_agent = space.attention in {"blocked", "done"} or is_idle_agent
+
+        prev = prev_map.get(space.workspace_id)
+        cached_primary_raw: str | None = None
+        curr_peek_hash = (
+            prev.peek_hash
+            if (
+                prev is not None
+                and prev.primary_pane_id == curr_pane_id
+                and prev.revision == curr_rev
+            )
+            else None
+        )
+
+        # Track sub-tab blocked changes and hashes.
+        prev_sub_map = {pid: (rev, ph) for pid, rev, ph in (prev.blocked_subtabs if prev else ())}
+        curr_blocked_subtabs: list[tuple[str, int, str | None]] = []
+        subtab_reads: list[tuple[dict[str, Any], str | None]] = []
+
+        if since_last:
+            primary_reason: str | None = None
+            if prev_cursor is None:
+                if (
+                    space.attention in {"blocked", "done"}
+                    or space.sub_tabs.any_blocked
+                    or (include_idle and is_idle_agent)
+                ):
+                    primary_reason = "initial"
+            elif prev is None:
+                if (
+                    space.attention in {"blocked", "done"}
+                    or space.sub_tabs.any_blocked
+                    or (include_idle and is_idle_agent)
+                ):
+                    primary_reason = "new_workspace"
+            else:
+                if space.attention == "blocked" and prev.attention != "blocked":
+                    primary_reason = "newly_blocked"
+                elif space.attention == "done" and prev.attention != "done":
+                    primary_reason = "settled_done"
+                elif is_idle_agent and prev.effective_status in {
+                    "working",
+                    "busy_bg",
+                    "unknown",
+                    "blocked",
+                }:
+                    primary_reason = "settled_idle"
+                elif curr_pane_id != prev.primary_pane_id and is_settled_agent:
+                    primary_reason = "pane_changed"
+                elif (
+                    is_settled_agent
+                    and curr_rev != prev.revision
+                    and pane is not None
+                    and peek_lines > 0
+                ):
+                    try:
+                        read = read_pane(
+                            pane.pane_id,
+                            has_agent=pane.agent_kind is not None,
+                            source=peek_source,
+                            lines=peek_lines,
+                        )
+                        raw_text = str(read["text"])
+                        curr_peek_hash = hash_peek_text(raw_text)
+                        if prev.peek_hash is None or curr_peek_hash != prev.peek_hash:
+                            primary_reason = "output_updated"
+                            cached_primary_raw = raw_text
+                    except CliError as exc:
+                        warnings.append(f"{space.workspace_id} ({pane.pane_id}): {exc.message}")
+
+            for bp in space.sub_tabs.blocked_panes:
+                bp_pid = str(bp["pane_id"])
+                bp_rev = int(bp.get("revision") or 0)
+                prev_sub = prev_sub_map.get(bp_pid)
+                if prev_cursor is None or prev_sub is None:
+                    subtab_reads.append((bp, None))
+                elif bp_rev != prev_sub[0] and peek_lines > 0:
+                    try:
+                        read = read_pane(
+                            bp_pid,
+                            has_agent=True,
+                            source=peek_source,
+                            lines=peek_lines,
+                        )
+                        bp_raw = str(read["text"])
+                        bp_hash = hash_peek_text(bp_raw)
+                        if prev_sub[1] is None or bp_hash != prev_sub[1]:
+                            subtab_reads.append((bp, bp_raw))
+                        else:
+                            curr_blocked_subtabs.append((bp_pid, bp_rev, prev_sub[1]))
+                    except CliError as exc:
+                        warnings.append(f"{space.workspace_id} ({bp_pid}): {exc.message}")
+                        curr_blocked_subtabs.append((bp_pid, bp_rev, prev_sub[1]))
+                else:
+                    curr_blocked_subtabs.append((bp_pid, bp_rev, prev_sub[1]))
+
+            if primary_reason is not None:
+                change_reason: str | None = primary_reason
+            elif subtab_reads:
+                change_reason = "initial" if prev_cursor is None else "subtab_blocked"
+            else:
+                change_reason = None
+
+            needs_attention = (
+                space.attention in {"blocked", "done"}
+                or space.sub_tabs.any_blocked
+                or (include_idle and is_idle_agent)
+            )
+            include_entry = change_reason is not None or include_all or workspace is not None
+            if not include_entry and (space.attention == "blocked" or space.sub_tabs.any_blocked):
+                still_blocked.append(
+                    {
+                        "workspace_id": space.workspace_id,
+                        "label": space.label,
+                        "reason": (
+                            "primary_blocked" if space.attention == "blocked" else "subtab_blocked"
+                        ),
+                    }
+                )
+        else:
+            change_reason = None
+            needs_attention = (
+                space.attention in {"blocked", "done"}
+                or space.sub_tabs.any_blocked
+                or (include_idle and is_idle_agent)
+            )
+            include_entry = needs_attention or include_all or workspace is not None
+            subtab_reads = [(bp, None) for bp in space.sub_tabs.blocked_panes]
 
         peeks: list[DigestPeek] = []
-        if peek_lines > 0:
-            pane = space.primary_pane
-            if pane is not None and (
-                space.attention in {"blocked", "done"} or workspace is not None
-            ):
-                try:
-                    read = read_pane(
-                        pane.pane_id,
-                        has_agent=pane.agent_kind is not None,
-                        source=peek_source,
-                        lines=peek_lines,
+        if include_entry and peek_lines > 0:
+            should_peek_primary = pane is not None and (
+                (
+                    not since_last
+                    and (
+                        space.attention in {"blocked", "done"}
+                        or (include_idle and is_idle_agent)
+                        or workspace is not None
                     )
+                )
+                or (
+                    since_last
+                    and change_reason is not None
+                    and (
+                        space.attention in {"blocked", "done"}
+                        or is_idle_agent
+                        or workspace is not None
+                    )
+                )
+            )
+            if should_peek_primary and pane is not None:
+                try:
+                    if cached_primary_raw is None:
+                        read = read_pane(
+                            pane.pane_id,
+                            has_agent=pane.agent_kind is not None,
+                            source=peek_source,
+                            lines=peek_lines,
+                        )
+                        cached_primary_raw = str(read["text"])
+                    curr_peek_hash = hash_peek_text(cached_primary_raw)
                     peeks.append(
-                        DigestPeek(
+                        _make_digest_peek(
                             tab_id=space.primary_tab_id or "",
                             tab_label=strip_tab_decorations(space.primary_tab_label or "Tab 1"),
                             pane_id=pane.pane_id,
@@ -1996,44 +2798,98 @@ def execute_digest(
                             agent_status=pane.effective_status,
                             is_primary=True,
                             lines=peek_lines,
-                            text=str(read["text"]),
+                            raw_text=cached_primary_raw,
+                            compact=compact,
+                            max_chars=max_chars,
                         )
                     )
                 except CliError as exc:
                     warnings.append(f"{space.workspace_id} ({pane.pane_id}): {exc.message}")
 
-            for bp in space.sub_tabs.blocked_panes:
-                bp_pane_id = bp["pane_id"]
+            for bp, pre_raw in subtab_reads:
+                bp_pane_id = str(bp["pane_id"])
+                bp_rev = int(bp.get("revision") or 0)
                 try:
-                    read = read_pane(
-                        bp_pane_id,
-                        has_agent=True,
-                        source=peek_source,
-                        lines=peek_lines,
-                    )
+                    if pre_raw is None:
+                        read = read_pane(
+                            bp_pane_id,
+                            has_agent=True,
+                            source=peek_source,
+                            lines=peek_lines,
+                        )
+                        bp_raw = str(read["text"])
+                    else:
+                        bp_raw = pre_raw
+                    curr_blocked_subtabs.append((bp_pane_id, bp_rev, hash_peek_text(bp_raw)))
                     peeks.append(
-                        DigestPeek(
-                            tab_id=bp["tab_id"],
-                            tab_label=bp["tab_label"],
+                        _make_digest_peek(
+                            tab_id=str(bp["tab_id"]),
+                            tab_label=str(bp["tab_label"]),
                             pane_id=bp_pane_id,
                             agent_kind=None,
                             agent_status="blocked",
                             is_primary=False,
                             lines=peek_lines,
-                            text=str(read["text"]),
+                            raw_text=bp_raw,
+                            compact=compact,
+                            max_chars=max_chars,
                         )
                     )
                 except CliError as exc:
                     warnings.append(f"{space.workspace_id} ({bp_pane_id}): {exc.message}")
+                    curr_blocked_subtabs.append((bp_pane_id, bp_rev, None))
+        elif since_last:
+            for bp, pre_raw in subtab_reads:
+                bp_pane_id = str(bp["pane_id"])
+                bp_rev = int(bp.get("revision") or 0)
+                bp_hash = hash_peek_text(pre_raw) if pre_raw is not None else None
+                curr_blocked_subtabs.append((bp_pane_id, bp_rev, bp_hash))
 
-        entries.append(
-            DigestEntry(
-                space=space,
-                needs_attention=needs_attention,
-                peeks=tuple(peeks),
-            )
+        # Deduplicate & sort blocked_subtabs in cursor entry.
+        subtab_by_pid = {pid: (pid, rev, ph) for pid, rev, ph in curr_blocked_subtabs}
+        next_cursor_entries[space.workspace_id] = DigestCursorEntry(
+            workspace_id=space.workspace_id,
+            label=space.label,
+            primary_pane_id=curr_pane_id,
+            agent_kind=curr_agent_kind,
+            raw_status=curr_raw,
+            effective_status=curr_eff,
+            attention=space.attention,
+            revision=curr_rev,
+            peek_hash=curr_peek_hash,
+            blocked_subtabs=tuple(sorted(subtab_by_pid.values(), key=lambda t: t[0])),
+            deleted_hint=space.deleted_hint,
         )
 
+        if include_entry:
+            entries.append(
+                DigestEntry(
+                    space=space,
+                    needs_attention=needs_attention,
+                    peeks=tuple(peeks),
+                    change_reason=change_reason,
+                )
+            )
+
+    closed_workspaces: list[dict[str, str]] = []
+    if since_last and prev_cursor is not None:
+        current_ids = {s.workspace_id for s in spaces}
+        for wid, prev_entry in sorted(prev_map.items()):
+            if wid not in current_ids:
+                closed_workspaces.append({"workspace_id": wid, "label": prev_entry.label})
+
+    changed_flag: bool | None = None
+    if since_last:
+        changed_flag = bool(
+            any(entry.change_reason is not None for entry in entries) or closed_workspaces
+        )
+
+    next_cursor = DigestCursor(
+        schema_version=1,
+        scope=cursor_scope,
+        updated_at=now if now is not None else time.time(),
+        workspaces=next_cursor_entries,
+    )
     return (
         DigestResult(
             total_workspaces=len(spaces),
@@ -2042,8 +2898,469 @@ def execute_digest(
             entries=tuple(entries),
             peek_lines=peek_lines,
             include_all=include_all,
+            has_active_work=active_work,
+            since_last=since_last,
+            changed=changed_flag,
+            compact=compact,
+            cursor_scope=cursor_scope if since_last else None,
+            still_blocked=tuple(still_blocked),
+            closed_workspaces=tuple(closed_workspaces),
         ),
+        next_cursor,
         warnings,
+    )
+
+
+def render_handoff_markdown(payload: Mapping[str, Any]) -> str:
+    """Render a compact human- and agent-readable Markdown handoff note."""
+    ws_id = payload.get("workspace_id", "")
+    tab_id = payload.get("tab_id", "")
+    old_pane = payload.get("old_pane_id", "")
+    new_pane = payload.get("new_pane_id", "")
+    gen = payload.get("generation", 1)
+    cursor_name = payload.get("cursor_name") or "(auto)"
+    rotate_ctx = payload.get("rotate_ctx", DEFAULT_ROTATE_CTX)
+    auto_config = payload.get("auto_config") or "default"
+    decisions = payload.get("pending_decisions") or []
+    note = payload.get("note") or ""
+    audit_tail = payload.get("recent_audit") or []
+
+    lines = [
+        f"# Herdr Commander Handoff — {ws_id} (Generation {gen})",
+        "",
+        f"- **Workspace / Tab**: `{ws_id}` / `{tab_id}`",
+        f"- **Retiring Pane (`--ack`)**: `{old_pane}`",
+        f"- **Successor Pane**: `{new_pane}`",
+        f"- **Digest Cursor**: `{cursor_name}`",
+        f"- **Auto Config**: `{auto_config}` (`--rotate-ctx {rotate_ctx}`)",
+        "",
+        "## Resume Checklist",
+        "",
+        (
+            f"1. Run `hcmd digest --since-last --no-advance --compact --json` "
+            f"(or `--cursor {cursor_name}` if named)."
+        ),
+        (
+            "2. Complete `/herdr-commander-init` (or `/hcmd-init`) reconciliation, "
+            f"then retire the old pane with `hcmd rotate --ack {old_pane} --json`."
+        ),
+        f"3. Resume `/hcmd-auto` with `--rotate-ctx {rotate_ctx}`.",
+    ]
+    if note:
+        lines.extend(["", "## Commander Note", "", str(note)])
+    lines.extend(["", "## Pending Human Decisions", ""])
+    if decisions:
+        lines.extend(f"- {item}" for item in decisions)
+    else:
+        lines.append("- None recorded.")
+    lines.extend(["", "## Recent Auto-Audit Tail", ""])
+    if audit_tail:
+        lines.extend(["```jsonl", *(str(line) for line in audit_tail), "```"])
+    else:
+        lines.append("- No recent audit entries.")
+    return "\n".join(lines) + "\n"
+
+
+def build_rotate_bootstrap_prompt(
+    *,
+    handoff_md_path: str,
+    old_pane_id: str,
+    cursor_name: str | None,
+    rotate_ctx: int,
+) -> str:
+    """Build the successor pane's bootstrap prompt for 2-phase same-tab rotation."""
+    cursor_hint = f" --cursor {cursor_name}" if cursor_name else ""
+    return (
+        f"Commander context rotation handoff: read `{handoff_md_path}` first.\n"
+        "1. Follow `/herdr-commander-init` (alias `/hcmd-init`) handoff resume procedure.\n"
+        f"2. Run `hcmd digest --since-last --no-advance{cursor_hint} --compact --json` "
+        "to inspect live Spaces without dropping deltas.\n"
+        "3. ONLY AFTER init completes cleanly, retire the previous pane with "
+        f"`hcmd rotate --ack {old_pane_id} --json`.\n"
+        f"4. Resume `/hcmd-auto` monitoring (context rotation threshold "
+        f"`--rotate-ctx {rotate_ctx}`{cursor_hint})."
+    )
+
+
+@dataclass(frozen=True)
+class RotatePlan:
+    """Validated plan for initiating a 2-phase same-tab pane rotation."""
+
+    workspace_id: str
+    tab_id: str
+    old_pane_id: str
+    cwd: str
+    launcher: str
+    direction: str
+    rotate_ctx: int
+    cooldown: float
+    generation: int
+    cursor_name: str | None
+    auto_config: str | None
+    pending_decisions: tuple[str, ...]
+    note: str | None
+
+
+def plan_rotate(
+    *,
+    caller: CallerContext,
+    tabs: Sequence[WorkspaceTabInfo],
+    launcher_name: str = "ay",
+    direction: str = "right",
+    rotate_ctx: int = DEFAULT_ROTATE_CTX,
+    cooldown: float = DEFAULT_ROTATE_COOLDOWN,
+    prev_handoff: Mapping[str, Any] | None = None,
+    cursor_name: str | None = None,
+    auto_config: str | None = None,
+    pending_decisions: Sequence[str] = (),
+    note: str | None = None,
+    force: bool = False,
+    now: float | None = None,
+) -> RotatePlan:
+    """Validate authority, launcher, direction, and cooldown before same-tab rotation."""
+    if caller.role == "pane_worker" and not force:
+        raise CliError(
+            "NOT_TAB_LEAD",
+            "Pane workers cannot initiate pane rotation without `--force`.",
+            "Run `hcmd rotate` from the primary Commander pane (`panes[0]`).",
+            details=caller.to_dict(),
+        )
+    spec = LAUNCHERS.get(launcher_name)
+    if spec is None or not spec.launches_agent:
+        valid = ", ".join(k for k, v in LAUNCHERS.items() if v.launches_agent)
+        raise CliError(
+            "INVALID_LAUNCHER",
+            f"Rotation requires an AI agent launcher, got {launcher_name!r}.",
+            f"Choose one of: {valid}.",
+            exit_code=EXIT_USAGE,
+        )
+    if direction not in VALID_SPLIT_DIRECTIONS:
+        raise CliError(
+            "INVALID_DIRECTION",
+            f"Unsupported split direction {direction!r}.",
+            f"Choose one of: {', '.join(VALID_SPLIT_DIRECTIONS)}.",
+            exit_code=EXIT_USAGE,
+        )
+    if not (1 <= rotate_ctx <= 100):
+        raise CliError(
+            "INVALID_ROTATE_CTX",
+            f"--rotate-ctx must be between 1 and 100, got {rotate_ctx}.",
+            "Pass e.g. `--rotate-ctx 30`.",
+            exit_code=EXIT_USAGE,
+        )
+    if cooldown < 0:
+        raise CliError(
+            "INVALID_COOLDOWN",
+            f"--cooldown cannot be negative, got {cooldown}.",
+            "Pass 0 or a positive number of seconds (default: 300).",
+            exit_code=EXIT_USAGE,
+        )
+
+    current_time = now if now is not None else time.time()
+    prev_gen = 0
+    if prev_handoff is not None:
+        prev_gen = int(prev_handoff.get("generation") or 0)
+        last_ts = float(prev_handoff.get("created_at") or 0.0)
+        elapsed = current_time - last_ts
+        if not force and cooldown > 0 and last_ts > 0 and elapsed < cooldown:
+            rem = cooldown - elapsed
+            raise CliError(
+                "ROTATE_COOLDOWN_ACTIVE",
+                (
+                    f"Rotation cooldown active ({rem:.0f}s remaining of {cooldown:.0f}s); "
+                    "refusing potential rotation loop."
+                ),
+                "Wait for cooldown to expire or pass `--force` to override.",
+                details={
+                    "cooldown_remaining_seconds": round(rem, 1),
+                    "cooldown_seconds": cooldown,
+                    "generation": prev_gen,
+                    "last_rotated_at": last_ts,
+                },
+            )
+
+    caller_tab = next((t for t in tabs if t.tab_id == caller.tab_id), None)
+    caller_pane = (
+        next((p for p in caller_tab.panes if p.pane_id == caller.pane_id), None)
+        if caller_tab
+        else None
+    )
+    cwd = caller_pane.cwd if caller_pane and caller_pane.cwd else os.getcwd()
+    resolved_dir = "right" if direction == "auto" else direction
+
+    return RotatePlan(
+        workspace_id=caller.workspace_id,
+        tab_id=caller.tab_id,
+        old_pane_id=caller.pane_id,
+        cwd=cwd,
+        launcher=spec.name,
+        direction=resolved_dir,
+        rotate_ctx=rotate_ctx,
+        cooldown=cooldown,
+        generation=prev_gen + 1,
+        cursor_name=cursor_name,
+        auto_config=auto_config,
+        pending_decisions=tuple(d for d in pending_decisions if d.strip()),
+        note=note,
+    )
+
+
+def execute_rotate(
+    plan: RotatePlan,
+    *,
+    client: SnapshotClient,
+    split_pane: SplitPaneFn,
+    run_pane: RunPaneFn,
+    start_agent: StartAgentFn,
+    prompt_fn: PromptAgentFn,
+    env: Mapping[str, str],
+    handoff_json_path: str,
+    handoff_md_path: str,
+    save_handoff: Callable[[Mapping[str, Any], str], None],
+    recent_audit: Sequence[str] = (),
+    select_backend: SelectBackendFn | None = None,
+    trust_workspace: TrustWorkspaceFn | None = None,
+    read_pane: ReadPaneFn | None = None,
+    send_keys: SendKeysFn | None = None,
+    dry_run: bool = False,
+    ready_timeout: float = 45.0,
+    verify_timeout: float = 10.0,
+    poll_interval: float = 0.5,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    now: float | None = None,
+) -> RotateResult:
+    """Split caller tab, launch successor agent, save handoff, and verify startup prompt."""
+    spec = LAUNCHERS[plan.launcher]
+    predicted_agent = _single_agent(spec)
+    if spec.selects_backend and select_backend is not None:
+        predicted_agent = resolve_backend_agent(select_backend())
+
+    if dry_run:
+        return RotateResult(
+            mode="rotate",
+            dry_run=True,
+            workspace_id=plan.workspace_id,
+            tab_id=plan.tab_id,
+            old_pane_id=plan.old_pane_id,
+            new_pane_id=None,
+            launcher=plan.launcher,
+            agent_kind=predicted_agent,
+            agent_status=None,
+            generation=plan.generation,
+            status="dry_run",
+            handoff_json_path=handoff_json_path,
+            handoff_md_path=handoff_md_path,
+            old_pane_closed=False,
+            prompt_sent=False,
+        )
+
+    created = split_pane(
+        plan.old_pane_id,
+        direction=plan.direction,
+        cwd=plan.cwd,
+        env_vars=None,
+    )
+    new_pane_id = str(created["pane_id"])
+
+    if trust_workspace is not None and plan.cwd:
+        trust_workspace(plan.cwd, spec.expected_agents, env)
+
+    agent_name = sanitize_agent_name(
+        f"cmd-g{plan.generation}",
+        collect_live_agent_names(client.snapshot()),
+        fallback="commander",
+    )
+    pane = _launch_agent_in_pane(
+        spec=spec,
+        workspace_id=plan.workspace_id,
+        pane_id=new_pane_id,
+        agent_name=agent_name,
+        env=env,
+        client=client,
+        run_pane=run_pane,
+        start_agent=start_agent,
+        ready_timeout=ready_timeout,
+        poll_interval=poll_interval,
+        sleep_fn=sleep_fn,
+        read_pane=read_pane,
+        send_keys=send_keys,
+    )
+
+    created_ts = now if now is not None else time.time()
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "pending_ack",
+        "workspace_id": plan.workspace_id,
+        "tab_id": plan.tab_id,
+        "old_pane_id": plan.old_pane_id,
+        "new_pane_id": new_pane_id,
+        "launcher": plan.launcher,
+        "generation": plan.generation,
+        "created_at": round(created_ts, 3),
+        "cursor_name": plan.cursor_name,
+        "rotate_ctx": plan.rotate_ctx,
+        "auto_config": plan.auto_config,
+        "pending_decisions": list(plan.pending_decisions),
+        "note": plan.note,
+        "recent_audit": list(recent_audit),
+    }
+    markdown = render_handoff_markdown(payload)
+    save_handoff(payload, markdown)
+
+    pane_kind = pane.agent_kind if pane else predicted_agent
+    bootstrap_prompt = build_rotate_bootstrap_prompt(
+        handoff_md_path=handoff_md_path,
+        old_pane_id=plan.old_pane_id,
+        cursor_name=plan.cursor_name,
+        rotate_ctx=plan.rotate_ctx,
+    )
+    pane = (
+        _send_kickoff_prompt_verified(
+            workspace_id=plan.workspace_id,
+            pane_id=new_pane_id,
+            agent_kind=pane_kind,
+            initial_revision=pane.revision if pane else 0,
+            prompt=bootstrap_prompt,
+            prompt_fn=prompt_fn,
+            client=client,
+            read_pane=read_pane,
+            send_keys=send_keys,
+            verify_started=True,
+            verify_timeout=verify_timeout,
+            poll_interval=min(0.4, poll_interval) if poll_interval > 0 else 0.4,
+            sleep_fn=sleep_fn,
+        )
+        or pane
+    )
+
+    return RotateResult(
+        mode="rotate",
+        dry_run=False,
+        workspace_id=plan.workspace_id,
+        tab_id=plan.tab_id,
+        old_pane_id=plan.old_pane_id,
+        new_pane_id=new_pane_id,
+        launcher=plan.launcher,
+        agent_kind=pane_kind,
+        agent_status=pane.effective_status if pane else None,
+        generation=plan.generation,
+        status="pending_ack",
+        handoff_json_path=handoff_json_path,
+        handoff_md_path=handoff_md_path,
+        old_pane_closed=False,
+        prompt_sent=True,
+    )
+
+
+def execute_rotate_ack(
+    *,
+    caller: CallerContext,
+    tabs: Sequence[WorkspaceTabInfo],
+    ack_pane_id: str,
+    prev_handoff: Mapping[str, Any] | None,
+    handoff_json_path: str,
+    handoff_md_path: str,
+    save_handoff: Callable[[Mapping[str, Any], str], None],
+    close_pane: ClosePaneFn,
+    force: bool = False,
+    dry_run: bool = False,
+    now: float | None = None,
+) -> RotateResult:
+    """Complete 2-phase rotation by verifying successor authority and closing old pane."""
+    clean_ack = ack_pane_id.strip()
+    if not clean_ack:
+        raise CliError(
+            "INVALID_TARGET",
+            "--ack pane ID cannot be empty.",
+            "Pass the retiring pane ID from the handoff file, e.g. `hcmd rotate --ack w1:p1`.",
+            exit_code=EXIT_USAGE,
+        )
+    if clean_ack == caller.pane_id:
+        raise CliError(
+            "CANNOT_ACK_SELF",
+            f"Refusing to ACK/close the calling pane itself ({caller.pane_id}).",
+            "Run `hcmd rotate --ack <old_pane_id>` from the newly launched successor pane.",
+        )
+
+    if not force:
+        if prev_handoff is None:
+            raise CliError(
+                "HANDOFF_NOT_FOUND",
+                f"No rotation handoff record found for workspace {caller.workspace_id}.",
+                "Check the handoff directory or pass `--force` if manual cleanup is intentional.",
+            )
+        if (
+            prev_handoff.get("workspace_id") != caller.workspace_id
+            or prev_handoff.get("tab_id") != caller.tab_id
+            or prev_handoff.get("old_pane_id") != clean_ack
+            or prev_handoff.get("new_pane_id") != caller.pane_id
+        ):
+            raise CliError(
+                "HANDOFF_MISMATCH",
+                (
+                    f"Handoff record expects successor {prev_handoff.get('new_pane_id')!r} "
+                    f"to retire {prev_handoff.get('old_pane_id')!r} "
+                    f"in {prev_handoff.get('tab_id')!r}; "
+                    f"caller is {caller.pane_id!r} retiring {clean_ack!r}."
+                ),
+                (
+                    "Run `--ack` from the designated successor pane with the matching old pane ID, "
+                    "or pass `--force`."
+                ),
+                details={
+                    "expected": {
+                        "workspace_id": prev_handoff.get("workspace_id"),
+                        "tab_id": prev_handoff.get("tab_id"),
+                        "old_pane_id": prev_handoff.get("old_pane_id"),
+                        "new_pane_id": prev_handoff.get("new_pane_id"),
+                    },
+                    "caller": caller.to_dict(),
+                },
+            )
+
+    caller_tab = next((t for t in tabs if t.tab_id == caller.tab_id), None)
+    target_exists = bool(
+        caller_tab is not None and any(p.pane_id == clean_ack for p in caller_tab.panes)
+    )
+    generation = int((prev_handoff or {}).get("generation") or 1)
+    launcher = (prev_handoff or {}).get("launcher")
+
+    old_pane_closed = False
+    if not dry_run:
+        if target_exists:
+            close_pane(clean_ack)
+            old_pane_closed = True
+        updated_payload = dict(prev_handoff or {})
+        updated_payload.update(
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "workspace_id": caller.workspace_id,
+                "tab_id": caller.tab_id,
+                "old_pane_id": clean_ack,
+                "new_pane_id": caller.pane_id,
+                "generation": generation,
+                "acked_at": round(now if now is not None else time.time(), 3),
+            }
+        )
+        save_handoff(updated_payload, render_handoff_markdown(updated_payload))
+
+    return RotateResult(
+        mode="ack",
+        dry_run=dry_run,
+        workspace_id=caller.workspace_id,
+        tab_id=caller.tab_id,
+        old_pane_id=clean_ack,
+        new_pane_id=caller.pane_id,
+        launcher=str(launcher) if isinstance(launcher, str) else None,
+        agent_kind=None,
+        agent_status=None,
+        generation=generation,
+        status="dry_run" if dry_run else "completed",
+        handoff_json_path=handoff_json_path,
+        handoff_md_path=handoff_md_path,
+        old_pane_closed=old_pane_closed,
+        prompt_sent=False,
     )
 
 

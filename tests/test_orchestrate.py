@@ -16,15 +16,33 @@ from herdr_commander.orchestrate import (
     LAUNCHERS,
     build_agent_start_args,
     build_pane_run_command,
+    compact_peek_text,
+    detect_startup_overlay,
     execute_digest,
+    execute_digest_with_cursor,
     execute_ensure,
+    execute_pane_spawn,
+    execute_rotate,
+    execute_rotate_ack,
     execute_send,
+    execute_tab_spawn,
+    execute_wait_with_cursor,
+    hash_peek_text,
+    normalize_peek_text,
     plan_ensure,
+    plan_pane_spawn,
+    plan_rotate,
+    plan_tab_spawn,
     resolve_backend_agent,
     sanitize_agent_name,
     validate_send,
 )
-from herdr_commander.snapshot import collect_workspace_panes, parse_snapshot
+from herdr_commander.snapshot import (
+    collect_workspace_panes,
+    parse_snapshot,
+    parse_workspace_tabs,
+    resolve_caller_context,
+)
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "snapshot_sample.json"
 
@@ -1288,6 +1306,608 @@ class DigestAndTrustOrchestrateTests(unittest.TestCase):
             start_agent=lambda _n, _k, _p, _a, timeout_ms=45000: {},
         )
         self.assertEqual(trust_calls, [("/home/user/gh/cb/CBRD-10002", ("codex",))])
+
+
+class DeltaDigestWaitAndRotateTests(unittest.TestCase):
+    def test_normalize_and_compact_peek_text(self) -> None:
+        raw_text = (
+            "\x1b[32mPrevious verbose logs\x1b[0m\n"
+            "- Status: done\n"
+            "- Summary: Built and verified feature.\n"
+            "- Evidence: 42 tests passed.\n"
+            "- Blockers / Next: none\n"
+            "────────────────────────\n"
+            "❯ \n"
+            "Orchestrator (Neon) │ ~/repo │ ctx ██░░░░ 17% 181k/1.0M │ gemini-5h 81% ·3h1m\n"
+        )
+        raw_text_tick = raw_text.replace("·3h1m", "·3h0m").replace("81%", "80%")
+        self.assertEqual(hash_peek_text(raw_text), hash_peek_text(raw_text_tick))
+        self.assertNotIn("gemini-5h", normalize_peek_text(raw_text))
+
+        compacted, truncated = compact_peek_text(raw_text, max_chars=200)
+        self.assertFalse(truncated)
+        self.assertTrue(compacted.startswith("- Status: done"))
+        self.assertNotIn("Previous verbose logs", compacted)
+
+        long_body = "\n".join(f"line {i:03d}: output payload" for i in range(60))
+        bounded, was_trunc = compact_peek_text(long_body, max_chars=120)
+        self.assertTrue(was_trunc)
+        self.assertTrue(bounded.startswith("...(truncated)...\n"))
+        self.assertLessEqual(len(bounded), 120)
+
+    def test_execute_digest_with_cursor_deltas_and_idle_transitions(self) -> None:
+        raw = copy.deepcopy(load_fixture())
+        pane_outputs: dict[str, str] = {
+            "w1:p1": "- Status: done\n- Summary: Done w1\n- Evidence: ok\n- Blockers / Next: none",
+            "w1:p4": "Allow command? [y/N]",
+            "w2:p4": "Parked idle",
+            "w6:p2": "Initial idle",
+        }
+        # Set w6 working initially so we can test working -> idle transition.
+        for p in raw["panes"]:
+            if p["pane_id"] == "w6:p2":
+                p["agent_status"] = "working"
+        for a in raw["agents"]:
+            if a["pane_id"] == "w6:p2":
+                a["agent_status"] = "working"
+
+        def fake_read(
+            pane_id: str,
+            *,
+            has_agent: bool = True,
+            source: str = "recent-unwrapped",
+            lines: int = 40,
+        ) -> dict:
+            return {"pane_id": pane_id, "text": pane_outputs.get(pane_id, "")}
+
+        spaces1 = [
+            s
+            for s in parse_snapshot(raw, self_workspace_id="w4", path_exists=lambda _p: True)
+            if not s.is_self
+        ]
+        res1, cursor1, warns1 = execute_digest_with_cursor(
+            spaces1,
+            read_pane=fake_read,
+            compact=True,
+            since_last=True,
+            prev_cursor=None,
+            cursor_scope="test",
+        )
+        self.assertEqual(warns1, [])
+        self.assertTrue(res1.changed)
+        self.assertTrue(res1.has_active_work)
+        self.assertEqual([e.space.workspace_id for e in res1.entries], ["w1"])
+        self.assertEqual(res1.entries[0].change_reason, "initial")
+
+        # Second identical run -> zero delta, zero re-peeks.
+        reads_before = dict(pane_outputs)
+        peek_calls: list[str] = []
+
+        def tracked_read(
+            pane_id: str,
+            *,
+            has_agent: bool = True,
+            source: str = "recent-unwrapped",
+            lines: int = 40,
+        ) -> dict:
+            peek_calls.append(pane_id)
+            return {"pane_id": pane_id, "text": reads_before.get(pane_id, "")}
+
+        res2, cursor2, _ = execute_digest_with_cursor(
+            spaces1,
+            read_pane=tracked_read,
+            compact=True,
+            since_last=True,
+            prev_cursor=cursor1,
+            cursor_scope="test",
+        )
+        self.assertFalse(res2.changed)
+        self.assertEqual(res2.entries, ())
+        self.assertEqual(peek_calls, [])
+        self.assertEqual(
+            res2.still_blocked,
+            ({"workspace_id": "w1", "label": "CBRD-10001-demo", "reason": "subtab_blocked"},),
+        )
+
+        # Spurious revision tick with identical normalized text -> suppressed.
+        raw_tick = copy.deepcopy(raw)
+        for p in raw_tick["panes"]:
+            if p["pane_id"] == "w1:p1":
+                p["revision"] = 101
+        for a in raw_tick["agents"]:
+            if a["pane_id"] == "w1:p1":
+                a["revision"] = 101
+        reads_before["w1:p1"] = (
+            reads_before["w1:p1"]
+            + "\nOrchestrator │ ~/r │ ctx █ 10% 10k/1.0M │ gemini-5h 80% ·2h59m"
+        )
+        spaces_tick = [
+            s
+            for s in parse_snapshot(raw_tick, self_workspace_id="w4", path_exists=lambda _p: True)
+            if not s.is_self
+        ]
+        res_tick, cursor3, _ = execute_digest_with_cursor(
+            spaces_tick,
+            read_pane=tracked_read,
+            compact=True,
+            since_last=True,
+            prev_cursor=cursor2,
+            cursor_scope="test",
+        )
+        self.assertFalse(res_tick.changed)
+        self.assertEqual(peek_calls, ["w1:p1"])
+
+        # w6 transitions working -> idle (settled_idle), while parked w2 stays suppressed.
+        # Also remove w3 to verify closed_workspaces reporting.
+        raw_next = copy.deepcopy(raw_tick)
+        raw_next["workspaces"] = [w for w in raw_next["workspaces"] if w["workspace_id"] != "w3"]
+        for p in raw_next["panes"]:
+            if p["pane_id"] == "w6:p2":
+                p["agent_status"] = "idle"
+                p["revision"] = 605
+        for a in raw_next["agents"]:
+            if a["pane_id"] == "w6:p2":
+                a["agent_status"] = "idle"
+                a["revision"] = 605
+        reads_before["w6:p2"] = "Claude finished task cleanly."
+        spaces_next = [
+            s
+            for s in parse_snapshot(raw_next, self_workspace_id="w4", path_exists=lambda _p: True)
+            if not s.is_self
+        ]
+        res_next, _cursor4, _ = execute_digest_with_cursor(
+            spaces_next,
+            read_pane=tracked_read,
+            compact=True,
+            since_last=True,
+            prev_cursor=cursor3,
+            cursor_scope="test",
+        )
+        self.assertTrue(res_next.changed)
+        self.assertEqual([e.space.workspace_id for e in res_next.entries], ["w6"])
+        self.assertEqual(res_next.entries[0].change_reason, "settled_idle")
+        self.assertIn("Claude finished task cleanly.", res_next.entries[0].peeks[0].text)
+        self.assertEqual(
+            res_next.closed_workspaces,
+            ({"workspace_id": "w3", "label": "old-experiment (deleted)"},),
+        )
+
+    def test_execute_wait_with_cursor_subtabs_idle_and_timeout(self) -> None:
+        base = copy.deepcopy(load_fixture())
+        # Make w1:p4 working initially and w6:p2 working; w1:p1 is already done.
+        for p in base["panes"]:
+            if p["pane_id"] in {"w1:p4", "w6:p2"}:
+                p["agent_status"] = "working"
+        for a in base["agents"]:
+            if a["pane_id"] in {"w1:p4", "w6:p2"}:
+                a["agent_status"] = "working"
+        for t in base["tabs"]:
+            if t["tab_id"] == "w1:t4":
+                t["agent_status"] = "working"
+
+        # Step 2 snapshot: self-workspace pane update ignored, then w1:p4 subtab becomes blocked.
+        after_subtab_blocked = copy.deepcopy(base)
+        for p in after_subtab_blocked["panes"]:
+            if p["pane_id"] == "w1:p4":
+                p["agent_status"] = "blocked"
+                p["revision"] = 999
+        for a in after_subtab_blocked["agents"]:
+            if a["pane_id"] == "w1:p4":
+                a["agent_status"] = "blocked"
+                a["revision"] = 999
+        for t in after_subtab_blocked["tabs"]:
+            if t["tab_id"] == "w1:t4":
+                t["agent_status"] = "blocked"
+
+        class SubtabWaitClient:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.subscribed_panes: list[str] = []
+
+            def snapshot(self) -> dict:
+                self.calls += 1
+                return base if self.calls == 1 else after_subtab_blocked
+
+            def read_detection(self, _pane_id: str) -> str:
+                return ""
+
+            def subscribe_events(self, pane_ids, *, deadline: float):
+                self.subscribed_panes = list(pane_ids)
+                # Self-workspace pane.updated must be ignored; subtab status change wakes.
+                yield {"event": "pane.updated", "data": {"workspace_id": "w4", "pane_id": "w4:p1"}}
+                yield {"event": "pane.agent_status_changed", "data": {"pane_id": "w1:p4"}}
+
+        client = SubtabWaitClient()
+        res, _cur, warns = execute_wait_with_cursor(
+            client=client,
+            until=("blocked", "done"),
+            workspace=None,
+            workers_only=True,
+            timeout=5.0,
+            verify_busy=False,
+            self_workspace_id="w4",
+            changes_only=True,
+            include_subtabs=True,
+            emit_digest=True,
+            compact=True,
+            read_pane=lambda pid, **_kw: {"pane_id": pid, "text": f"text:{pid}"},
+            debounce_seconds=0.0,
+        )
+        self.assertEqual(warns, [])
+        self.assertIn("w1:p4", client.subscribed_panes)
+        self.assertFalse(res.from_initial_snapshot)
+        self.assertEqual(res.reason, "changed")
+        self.assertIsNotNone(res.digest)
+        assert res.digest is not None
+        self.assertEqual(res.digest.entries[0].change_reason, "subtab_blocked")
+
+        # --stop-when-idle exits immediately when no worker is active.
+        idle_snap = copy.deepcopy(base)
+        for p in idle_snap["panes"]:
+            if p["agent_status"] == "working":
+                p["agent_status"] = "idle"
+        for a in idle_snap["agents"]:
+            if a["agent_status"] == "working":
+                a["agent_status"] = "idle"
+
+        class IdleClient:
+            def snapshot(self) -> dict:
+                return idle_snap
+
+            def read_detection(self, _pane_id: str) -> str:
+                return ""
+
+            def subscribe_events(self, _pane_ids, *, deadline: float):
+                raise AssertionError("subscribe_events should not be called when already idle")
+                yield {}
+
+        idle_res, _, _ = execute_wait_with_cursor(
+            client=IdleClient(),
+            until=("blocked", "done"),
+            workspace=None,
+            workers_only=True,
+            timeout=5.0,
+            verify_busy=False,
+            self_workspace_id="w4",
+            changes_only=True,
+            stop_when_idle=True,
+        )
+        self.assertEqual(idle_res.reason, "no_active_work")
+        self.assertFalse(idle_res.timed_out)
+
+        # --allow-timeout returns timed_out=True instead of raising WAIT_TIMEOUT.
+        class EmptyEventsClient:
+            def snapshot(self) -> dict:
+                return base
+
+            def read_detection(self, _pane_id: str) -> str:
+                return ""
+
+            def subscribe_events(self, _pane_ids, *, deadline: float):
+                return iter(())
+
+        to_res, _, _ = execute_wait_with_cursor(
+            client=EmptyEventsClient(),
+            until=("blocked", "done"),
+            workspace=None,
+            workers_only=True,
+            timeout=1.0,
+            verify_busy=False,
+            self_workspace_id="w4",
+            changes_only=True,
+            allow_timeout=True,
+        )
+        self.assertTrue(to_res.timed_out)
+        self.assertEqual(to_res.reason, "timeout")
+
+    def test_ay_startup_overlay_dismiss_retry_and_failure(self) -> None:
+        self.assertTrue(detect_startup_overlay("Introducing Gemini 4 Neon\nesc to dismiss"))
+        self.assertFalse(detect_startup_overlay("Ready at prompt >"))
+
+        raw_before = copy.deepcopy(load_fixture())
+        raw_idle = copy.deepcopy(raw_before)
+        raw_idle["tabs"].append(
+            {
+                "agent_status": "idle",
+                "focused": False,
+                "label": "review",
+                "number": 5,
+                "pane_count": 1,
+                "tab_id": "w1:t5",
+                "workspace_id": "w1",
+            }
+        )
+        raw_idle["panes"].append(
+            {
+                "agent": "agy",
+                "agent_status": "idle",
+                "cwd": "/tmp/repo",
+                "foreground_cwd": "/tmp/repo",
+                "focused": False,
+                "pane_id": "w1:p5",
+                "revision": 10,
+                "tab_id": "w1:t5",
+                "workspace_id": "w1",
+            }
+        )
+        raw_idle["agents"].append(
+            {
+                "agent": "agy",
+                "agent_status": "idle",
+                "cwd": "/tmp/repo",
+                "interactive_ready": True,
+                "name": "review",
+                "pane_id": "w1:p5",
+                "revision": 10,
+                "tab_id": "w1:t5",
+                "workspace_id": "w1",
+            }
+        )
+        raw_working = copy.deepcopy(raw_idle)
+        raw_working["panes"][-1]["agent_status"] = "working"
+        raw_working["panes"][-1]["revision"] = 11
+        raw_working["agents"][-1]["agent_status"] = "working"
+        raw_working["agents"][-1]["revision"] = 11
+
+        caller = resolve_caller_context(
+            raw_before,
+            {"HERDR_WORKSPACE_ID": "w1", "HERDR_TAB_ID": "w1:t1", "HERDR_PANE_ID": "w1:p1"},
+        )
+        tabs = parse_workspace_tabs(raw_before, "w1", self_tab_id="w1:t1", self_pane_id="w1:p1")
+        plan = plan_tab_spawn(
+            caller=caller,
+            tabs=tabs,
+            label="review",
+            cwd="/tmp/repo",
+            launcher_name="ay",
+            prompt="Inspect diff",
+            dir_exists=lambda _p: True,
+        )
+
+        # Simulate late banner swallowing first prompt, dismissed via esc, then second prompt works.
+        class OverlayClient:
+            def __init__(self) -> None:
+                self.prompts_sent = 0
+
+            def snapshot(self) -> dict:
+                return raw_working if self.prompts_sent >= 2 else raw_idle
+
+        oc = OverlayClient()
+        keys_sent: list[tuple[str, tuple[str, ...]]] = []
+        overlay_state = {"visible": True}
+
+        def fake_read_pane(pane_id: str, **_kw) -> dict:
+            if overlay_state["visible"]:
+                return {"pane_id": pane_id, "text": "Introducing Gemini 4 Neon\nesc to dismiss"}
+            return {"pane_id": pane_id, "text": "Orchestrator (Neon) │ >"}
+
+        def fake_send_keys(pane_id: str, keys) -> dict:
+            keys_sent.append((pane_id, tuple(keys)))
+            overlay_state["visible"] = False
+            return {}
+
+        def fake_prompt(pane_id: str, _prompt: str, *, wait: bool = False, timeout_ms=None) -> dict:
+            oc.prompts_sent += 1
+            if oc.prompts_sent == 1:
+                # Re-appear banner right after 1st prompt simulation.
+                overlay_state["visible"] = True
+            return {}
+
+        res = execute_tab_spawn(
+            plan,
+            client=oc,
+            create_tab=lambda wid, **_kw: {
+                "workspace_id": wid,
+                "tab_id": "w1:t5",
+                "pane_id": "w1:p5",
+            },
+            run_pane=lambda _pid, _cmd: None,
+            start_agent=lambda *_a, **_kw: {},
+            prompt_fn=fake_prompt,
+            env={},
+            read_pane=fake_read_pane,
+            send_keys=fake_send_keys,
+            verify_timeout=0.05,
+            poll_interval=0.01,
+            sleep_fn=lambda _s: None,
+        )
+        self.assertTrue(res.prompt_sent)
+        self.assertEqual(res.agent_status, "working")
+        self.assertEqual(oc.prompts_sent, 2)
+        self.assertGreaterEqual(len(keys_sent), 2)
+        self.assertEqual(keys_sent[0], ("w1:p5", ("esc",)))
+
+        # If both attempts stay idle, raise PROMPT_NOT_ACCEPTED.
+        class StuckIdleClient:
+            def snapshot(self) -> dict:
+                return raw_idle
+
+        with self.assertRaises(CliError) as stuck_err:
+            execute_pane_spawn(
+                plan_pane_spawn(
+                    caller=caller,
+                    tabs=tabs,
+                    cwd="/tmp/repo",
+                    launcher_name="ay",
+                    prompt="Inspect diff",
+                    dir_exists=lambda _p: True,
+                ),
+                client=StuckIdleClient(),
+                split_pane=lambda *_a, **_kw: {"pane_id": "w1:p5"},
+                run_pane=lambda _pid, _cmd: None,
+                start_agent=lambda *_a, **_kw: {},
+                prompt_fn=lambda *_a, **_kw: {},
+                env={},
+                read_pane=lambda pid, **_kw: {"pane_id": pid, "text": "Ready >"},
+                send_keys=lambda _pid, _keys: {},
+                verify_timeout=0.02,
+                poll_interval=0.01,
+                sleep_fn=lambda _s: None,
+            )
+        self.assertEqual(stuck_err.exception.code, "PROMPT_NOT_ACCEPTED")
+
+    def test_rotate_cooldown_same_tab_split_and_ack(self) -> None:
+        raw = copy.deepcopy(load_fixture())
+        caller = resolve_caller_context(
+            raw,
+            {"HERDR_WORKSPACE_ID": "w2", "HERDR_TAB_ID": "w2:t4", "HERDR_PANE_ID": "w2:p4"},
+        )
+        tabs = parse_workspace_tabs(raw, "w2", self_tab_id="w2:t4", self_pane_id="w2:p4")
+
+        # Cooldown rejects rapid repeat rotation unless --force.
+        with self.assertRaises(CliError) as cd_err:
+            plan_rotate(
+                caller=caller,
+                tabs=tabs,
+                prev_handoff={"generation": 2, "created_at": 1000.0},
+                cooldown=300.0,
+                now=1050.0,
+            )
+        self.assertEqual(cd_err.exception.code, "ROTATE_COOLDOWN_ACTIVE")
+        forced_plan = plan_rotate(
+            caller=caller,
+            tabs=tabs,
+            prev_handoff={"generation": 2, "created_at": 1000.0},
+            cooldown=300.0,
+            force=True,
+            now=1050.0,
+        )
+        self.assertEqual(forced_plan.generation, 3)
+
+        # Full rotate flow: splits caller tab without HERDR_PANE_ROLE=worker.
+        raw_after_launch = copy.deepcopy(raw)
+        raw_after_launch["panes"].append(
+            {
+                "agent": "agy",
+                "agent_status": "idle",
+                "cwd": "/home/user/gh/demo-skills",
+                "foreground_cwd": "/home/user/gh/demo-skills",
+                "focused": False,
+                "pane_id": "w2:p9",
+                "revision": 300,
+                "tab_id": "w2:t4",
+                "workspace_id": "w2",
+            }
+        )
+        raw_after_launch["agents"].append(
+            {
+                "agent": "agy",
+                "agent_status": "idle",
+                "cwd": "/home/user/gh/demo-skills",
+                "interactive_ready": True,
+                "name": "cmd-g3",
+                "pane_id": "w2:p9",
+                "revision": 300,
+                "tab_id": "w2:t4",
+                "workspace_id": "w2",
+            }
+        )
+        raw_after_prompt = copy.deepcopy(raw_after_launch)
+        raw_after_prompt["panes"][-1]["agent_status"] = "working"
+        raw_after_prompt["panes"][-1]["revision"] = 301
+        raw_after_prompt["agents"][-1]["agent_status"] = "working"
+        raw_after_prompt["agents"][-1]["revision"] = 301
+
+        class RotateClient:
+            def __init__(self) -> None:
+                self.prompted = False
+
+            def snapshot(self) -> dict:
+                return raw_after_prompt if self.prompted else raw_after_launch
+
+        rc = RotateClient()
+        split_calls: list[dict] = []
+        saved: list[tuple[dict, str]] = []
+
+        def fake_prompt(pane_id: str, prompt: str, *, wait: bool = False, timeout_ms=None) -> dict:
+            rc.prompted = True
+            self.assertIn("hcmd rotate --ack w2:p4", prompt)
+            return {}
+
+        rotate_res = execute_rotate(
+            forced_plan,
+            client=rc,
+            split_pane=lambda target_pid, *, direction, cwd, env_vars=None: (
+                split_calls.append(
+                    {"target": target_pid, "direction": direction, "cwd": cwd, "env": env_vars}
+                )
+                or {"pane_id": "w2:p9"}
+            ),
+            run_pane=lambda _pid, _cmd: None,
+            start_agent=lambda *_a, **_kw: {},
+            prompt_fn=fake_prompt,
+            env={},
+            handoff_json_path="/tmp/w2.json",
+            handoff_md_path="/tmp/w2.md",
+            save_handoff=lambda p, m: saved.append((dict(p), m)),
+            recent_audit=['{"action":"check"}'],
+            read_pane=lambda pid, **_kw: {"pane_id": pid, "text": "Orchestrator │ >"},
+            send_keys=lambda _pid, _keys: {},
+            verify_timeout=0.05,
+            poll_interval=0.01,
+            sleep_fn=lambda _s: None,
+            now=1200.0,
+        )
+        self.assertEqual(rotate_res.status, "pending_ack")
+        self.assertFalse(rotate_res.old_pane_closed)
+        self.assertEqual(rotate_res.new_pane_id, "w2:p9")
+        self.assertIsNone(split_calls[0]["env"])
+        self.assertEqual(saved[0][0]["status"], "pending_ack")
+
+        # Phase 2 --ack guards: no self-ack, reject mismatch, successor closes old.
+        with self.assertRaises(CliError) as self_ack_err:
+            execute_rotate_ack(
+                caller=caller,
+                tabs=tabs,
+                ack_pane_id="w2:p4",
+                prev_handoff=saved[0][0],
+                handoff_json_path="/tmp/w2.json",
+                handoff_md_path="/tmp/w2.md",
+                save_handoff=lambda p, m: saved.append((dict(p), m)),
+                close_pane=lambda _pid: None,
+            )
+        self.assertEqual(self_ack_err.exception.code, "CANNOT_ACK_SELF")
+
+        wrong_caller = resolve_caller_context(
+            raw_after_prompt,
+            {"HERDR_WORKSPACE_ID": "w2", "HERDR_TAB_ID": "w2:t4", "HERDR_PANE_ID": "w2:p5"},
+        )
+        tabs_after = parse_workspace_tabs(
+            raw_after_prompt, "w2", self_tab_id="w2:t4", self_pane_id="w2:p9"
+        )
+        with self.assertRaises(CliError) as mismatch_err:
+            execute_rotate_ack(
+                caller=wrong_caller,
+                tabs=tabs_after,
+                ack_pane_id="w2:p4",
+                prev_handoff=saved[0][0],
+                handoff_json_path="/tmp/w2.json",
+                handoff_md_path="/tmp/w2.md",
+                save_handoff=lambda p, m: saved.append((dict(p), m)),
+                close_pane=lambda _pid: None,
+            )
+        self.assertEqual(mismatch_err.exception.code, "HANDOFF_MISMATCH")
+
+        successor_caller = resolve_caller_context(
+            raw_after_prompt,
+            {"HERDR_WORKSPACE_ID": "w2", "HERDR_TAB_ID": "w2:t4", "HERDR_PANE_ID": "w2:p9"},
+        )
+        closed_panes: list[str] = []
+        ack_res = execute_rotate_ack(
+            caller=successor_caller,
+            tabs=tabs_after,
+            ack_pane_id="w2:p4",
+            prev_handoff=saved[0][0],
+            handoff_json_path="/tmp/w2.json",
+            handoff_md_path="/tmp/w2.md",
+            save_handoff=lambda p, m: saved.append((dict(p), m)),
+            close_pane=closed_panes.append,
+            now=1210.0,
+        )
+        self.assertEqual(ack_res.status, "completed")
+        self.assertTrue(ack_res.old_pane_closed)
+        self.assertEqual(closed_panes, ["w2:p4"])
+        self.assertEqual(saved[-1][0]["status"], "completed")
 
 
 if __name__ == "__main__":

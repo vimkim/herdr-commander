@@ -11,10 +11,13 @@ from herdr_commander.snapshot import (
     correlate_work_tracker,
     filter_spaces,
     find_matching_spaces,
+    has_active_work,
+    parse_self_context_statusline,
     parse_snapshot,
     resolve_peek_target,
     resolve_target,
     verify_claude_busy,
+    verify_subtabs_claude_busy,
 )
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "snapshot_sample.json"
@@ -62,7 +65,14 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(w1.sub_tabs.status_counts, {"working": 1, "blocked": 1})
         self.assertEqual(
             w1.sub_tabs.blocked_panes,
-            ({"tab_id": "w1:t4", "tab_label": "3 tc-pr-1234", "pane_id": "w1:p4"},),
+            (
+                {
+                    "tab_id": "w1:t4",
+                    "tab_label": "3 tc-pr-1234",
+                    "pane_id": "w1:p4",
+                    "revision": 102,
+                },
+            ),
         )
 
         # Deleted workspace becomes unknown attention.
@@ -414,6 +424,99 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(CliError) as missing_pane:
             resolve_peek_target(raw, spaces, "w1", pane_selector="p99")
         self.assertEqual(missing_pane.exception.code, "PANE_NOT_FOUND")
+
+    def test_parse_self_context_statusline_variants(self) -> None:
+        ay_line = (
+            "some output\n"
+            "\x1b[1mOrchestrator (Neon) [bypass]\x1b[0m │ ~/gh/herdr-commander (main) │ "
+            "\x1b[32mctx ██░░░░░░░░ 17%\x1b[0m \x1b[2m181k/1.0M\x1b[0m │ "
+            "gemini-5h 81% ·3h1m │ gemini-7d 72% ·4d23h\n"
+        )
+        ay_res = parse_self_context_statusline(ay_line)
+        self.assertTrue(ay_res["parsed"])
+        self.assertEqual(ay_res["model_display"], "Orchestrator (Neon) [bypass]")
+        self.assertEqual(ay_res["ctx_percent"], 17)
+        self.assertEqual(ay_res["tokens_used"], 181_000)
+        self.assertEqual(ay_res["tokens_limit"], 1_000_000)
+        self.assertEqual(ay_res["tokens_display"], "181k/1.0M")
+        self.assertEqual(
+            ay_res["rate_limits"],
+            {
+                "5h": {"remaining_percent": 81, "resets_in": "3h1m"},
+                "7d": {"remaining_percent": 72, "resets_in": "4d23h"},
+            },
+        )
+
+        claude_line = (
+            "Opus 4.1 │ ~/gh/herdr-commander (feat) │ "
+            "ctx ███░░░░░░░ 32% 64k/200k │ 5h 74% ·2h15m │ 7d 88% ·4d10h"
+        )
+        claude_res = parse_self_context_statusline(claude_line)
+        self.assertTrue(claude_res["parsed"])
+        self.assertEqual(claude_res["model_display"], "Opus 4.1")
+        self.assertEqual(claude_res["ctx_percent"], 32)
+        self.assertEqual(claude_res["tokens_used"], 64_000)
+        self.assertEqual(claude_res["tokens_limit"], 200_000)
+
+        pct_only = parse_self_context_statusline("Opus │ ~/repo │ ctx ███░░░░░░░ 45%")
+        self.assertTrue(pct_only["parsed"])
+        self.assertEqual(pct_only["ctx_percent"], 45)
+        self.assertIsNone(pct_only["tokens_used"])
+
+        fallback_ratio = parse_self_context_statusline("model │ ~/repo │ 250k/1.0M")
+        self.assertTrue(fallback_ratio["parsed"])
+        self.assertEqual(fallback_ratio["ctx_percent"], 25)
+
+        unparsed = parse_self_context_statusline("plain shell prompt\n$ ls -la\n")
+        self.assertFalse(unparsed["parsed"])
+        self.assertIsNone(unparsed["ctx_percent"])
+
+    def test_has_active_work_and_subtab_busy_verification(self) -> None:
+        raw = load_fixture()
+        spaces = parse_snapshot(raw, self_workspace_id="w4", path_exists=lambda _p: True)
+        workers = [s for s in spaces if not s.is_self]
+        # w1 has sub_tabs.any_working == True.
+        self.assertTrue(has_active_work(workers))
+
+        # Keep only w6 (idle claude) and w5 (shell) -> idle until verified busy_bg.
+        idle_only = [s for s in workers if s.workspace_id in {"w5", "w6"}]
+        self.assertFalse(has_active_work(idle_only))
+        verified = verify_claude_busy(
+            idle_only,
+            lambda _pid: "────────\n❯ \n────────\n⏵⏵ bypass on · 1 background agent",
+        )
+        self.assertTrue(has_active_work(verified))
+
+        # Sub-tab claude background busy promotion.
+        raw_sub = load_fixture()
+        for t in raw_sub["tabs"]:
+            if t["tab_id"] == "w1:t2":
+                t["agent_status"] = "idle"
+        for p in raw_sub["panes"]:
+            if p["pane_id"] == "w1:p2":
+                p["agent"] = "claude"
+                p["agent_status"] = "idle"
+        for a in raw_sub["agents"]:
+            if a["pane_id"] == "w1:p2":
+                a["agent"] = "claude"
+                a["agent_status"] = "idle"
+        sub_spaces = [
+            s
+            for s in parse_snapshot(raw_sub, self_workspace_id="w4", path_exists=lambda _p: True)
+            if s.workspace_id == "w1"
+        ]
+        self.assertFalse(sub_spaces[0].sub_tabs.any_working)
+        promoted = verify_subtabs_claude_busy(
+            raw_sub,
+            sub_spaces,
+            lambda pid: (
+                "────────\n❯ \n────────\n⏵⏵ bypass on · 1 background agent"
+                if pid == "w1:p2"
+                else ""
+            ),
+        )
+        self.assertTrue(promoted[0].sub_tabs.any_working)
+        self.assertEqual(promoted[0].sub_tabs.status_counts["working"], 1)
 
 
 if __name__ == "__main__":

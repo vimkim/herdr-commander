@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -31,6 +32,10 @@ DEFAULT_MAX_SUB_TABS = 8
 DEFAULT_MAX_WORKER_PANES = 3
 DEFAULT_MAX_SPACE_AGENTS = 4
 DEFAULT_MAX_SESSION_AGENTS = 10
+
+DEFAULT_MAX_PEEK_CHARS = 1500
+DEFAULT_ROTATE_CTX = 30
+DEFAULT_ROTATE_COOLDOWN = 300.0
 
 VALID_SPLIT_DIRECTIONS = ("auto", "right", "down")
 VALID_ON_EXISTING_POLICIES = ("reuse", "fail", "new")
@@ -113,7 +118,7 @@ class SubTabRollup:
     status_counts: dict[str, int]
     any_blocked: bool
     any_working: bool
-    blocked_panes: tuple[dict[str, str], ...] = ()
+    blocked_panes: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -189,9 +194,128 @@ class DigestPeek:
     is_primary: bool
     lines: int
     text: str
+    truncated: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data: dict[str, Any] = {
+            "tab_id": self.tab_id,
+            "tab_label": self.tab_label,
+            "pane_id": self.pane_id,
+            "agent_kind": self.agent_kind,
+            "agent_status": self.agent_status,
+            "is_primary": self.is_primary,
+            "lines": self.lines,
+            "text": self.text,
+        }
+        if self.truncated:
+            data["truncated"] = True
+        return data
+
+
+@dataclass(frozen=True)
+class DigestCursorEntry:
+    """Persisted watermark state for one workspace across `hcmd digest --since-last` calls."""
+
+    workspace_id: str
+    label: str
+    primary_pane_id: str | None
+    agent_kind: str | None
+    raw_status: str
+    effective_status: str
+    attention: str
+    revision: int
+    peek_hash: str | None = None
+    blocked_subtabs: tuple[tuple[str, int, str | None], ...] = ()
+    deleted_hint: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "workspace_id": self.workspace_id,
+            "label": self.label,
+            "primary_pane_id": self.primary_pane_id,
+            "agent_kind": self.agent_kind,
+            "raw_status": self.raw_status,
+            "effective_status": self.effective_status,
+            "attention": self.attention,
+            "revision": self.revision,
+            "peek_hash": self.peek_hash,
+            "blocked_subtabs": [
+                {"pane_id": pid, "revision": rev, "peek_hash": ph}
+                for pid, rev, ph in self.blocked_subtabs
+            ],
+            "deleted_hint": self.deleted_hint,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> DigestCursorEntry:
+        subtabs: list[tuple[str, int, str | None]] = []
+        raw_subs = raw.get("blocked_subtabs")
+        if isinstance(raw_subs, list):
+            for item in raw_subs:
+                if isinstance(item, dict) and isinstance(item.get("pane_id"), str):
+                    rev = int(item.get("revision") or 0)
+                    ph = item.get("peek_hash")
+                    subtabs.append((item["pane_id"], rev, str(ph) if isinstance(ph, str) else None))
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    pid = str(item[0])
+                    rev = int(item[1] or 0)
+                    ph = str(item[2]) if len(item) >= 3 and isinstance(item[2], str) else None
+                    subtabs.append((pid, rev, ph))
+        subtabs.sort(key=lambda t: t[0])
+        return cls(
+            workspace_id=str(raw.get("workspace_id") or ""),
+            label=str(raw.get("label") or ""),
+            primary_pane_id=(
+                str(raw["primary_pane_id"]) if isinstance(raw.get("primary_pane_id"), str) else None
+            ),
+            agent_kind=(str(raw["agent_kind"]) if isinstance(raw.get("agent_kind"), str) else None),
+            raw_status=str(raw.get("raw_status") or "unknown"),
+            effective_status=str(raw.get("effective_status") or "unknown"),
+            attention=str(raw.get("attention") or "unknown"),
+            revision=int(raw.get("revision") or 0),
+            peek_hash=str(raw["peek_hash"]) if isinstance(raw.get("peek_hash"), str) else None,
+            blocked_subtabs=tuple(subtabs),
+            deleted_hint=bool(raw.get("deleted_hint", False)),
+        )
+
+
+@dataclass(frozen=True)
+class DigestCursor:
+    """Persisted watermark cursor across workspaces for a named or scoped digest slot."""
+
+    schema_version: int = 1
+    scope: str = ""
+    updated_at: float = 0.0
+    workspaces: dict[str, DigestCursorEntry] | None = None
+
+    def entries_map(self) -> dict[str, DigestCursorEntry]:
+        return self.workspaces or {}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "scope": self.scope,
+            "updated_at": round(self.updated_at, 3),
+            "workspaces": {
+                wid: entry.to_dict() for wid, entry in sorted(self.entries_map().items())
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> DigestCursor:
+        ws_map: dict[str, DigestCursorEntry] = {}
+        raw_ws = raw.get("workspaces")
+        if isinstance(raw_ws, dict):
+            for wid, entry_raw in raw_ws.items():
+                if isinstance(wid, str) and isinstance(entry_raw, dict):
+                    entry = DigestCursorEntry.from_dict({**entry_raw, "workspace_id": wid})
+                    ws_map[wid] = entry
+        return cls(
+            schema_version=int(raw.get("schema_version") or 1),
+            scope=str(raw.get("scope") or ""),
+            updated_at=float(raw.get("updated_at") or 0.0),
+            workspaces=ws_map,
+        )
 
 
 @dataclass(frozen=True)
@@ -201,13 +325,47 @@ class DigestEntry:
     space: SpaceSnapshot
     needs_attention: bool
     peeks: tuple[DigestPeek, ...] = ()
+    change_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "needs_attention": self.needs_attention,
             "workspace": self.space.to_dict(include_tabs=False),
             "peeks": [peek.to_dict() for peek in self.peeks],
         }
+        if self.change_reason is not None:
+            data["change_reason"] = self.change_reason
+        return data
+
+    def to_compact_dict(self) -> dict[str, Any]:
+        pane = self.space.primary_pane
+        compact_ws: dict[str, Any] = {
+            "workspace_id": self.space.workspace_id,
+            "label": self.space.label,
+            "attention": self.space.attention,
+            "effective_status": pane.effective_status if pane else None,
+            "agent_kind": pane.agent_kind if pane else None,
+            "primary_tab_id": self.space.primary_tab_id,
+            "pane_id": pane.pane_id if pane else None,
+            "sub_tabs": {
+                "extra_tab_count": self.space.sub_tabs.extra_tab_count,
+                "extra_pane_count": self.space.sub_tabs.extra_pane_count,
+                "status_counts": self.space.sub_tabs.status_counts,
+                "any_blocked": self.space.sub_tabs.any_blocked,
+                "any_working": self.space.sub_tabs.any_working,
+            },
+            "ticket_key": self.space.ticket_key,
+            "work_item_ids": list(self.space.work_item_ids),
+            "deleted_hint": self.space.deleted_hint,
+        }
+        data: dict[str, Any] = {
+            "needs_attention": self.needs_attention,
+            "workspace": compact_ws,
+            "peeks": [peek.to_dict() for peek in self.peeks],
+        }
+        if self.change_reason is not None:
+            data["change_reason"] = self.change_reason
+        return data
 
 
 @dataclass(frozen=True)
@@ -220,17 +378,39 @@ class DigestResult:
     entries: tuple[DigestEntry, ...]
     peek_lines: int
     include_all: bool
+    has_active_work: bool = False
+    since_last: bool = False
+    changed: bool | None = None
+    compact: bool = False
+    cursor_scope: str | None = None
+    still_blocked: tuple[dict[str, str], ...] = ()
+    closed_workspaces: tuple[dict[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        entries_payload = (
+            [entry.to_compact_dict() for entry in self.entries]
+            if self.compact
+            else [entry.to_dict() for entry in self.entries]
+        )
+        data: dict[str, Any] = {
             "total_workspaces": self.total_workspaces,
             "count": len(self.entries),
             "counts": self.counts,
             "sub_tabs_blocked_count": self.sub_tabs_blocked_count,
+            "has_active_work": self.has_active_work,
             "peek_lines": self.peek_lines,
             "include_all": self.include_all,
-            "entries": [entry.to_dict() for entry in self.entries],
+            "entries": entries_payload,
         }
+        if self.compact:
+            data["compact"] = True
+        if self.since_last:
+            data["since_last"] = True
+            data["changed"] = self.changed
+            data["cursor_scope"] = self.cursor_scope
+            data["still_blocked"] = list(self.still_blocked)
+            data["closed_workspaces"] = list(self.closed_workspaces)
+        return data
 
 
 @dataclass(frozen=True)
@@ -241,14 +421,70 @@ class WaitResult:
     matched: tuple[SpaceSnapshot, ...]
     elapsed_seconds: float
     from_initial_snapshot: bool
+    reason: str = "matched"  # "matched" | "changed" | "timeout" | "no_active_work"
+    timed_out: bool = False
+    digest: DigestResult | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "until": list(self.until),
             "matched": [space.to_dict() for space in self.matched],
             "elapsed_seconds": round(self.elapsed_seconds, 3),
             "from_initial_snapshot": self.from_initial_snapshot,
+            "reason": self.reason,
+            "timed_out": self.timed_out,
         }
+        if self.digest is not None:
+            data["digest"] = self.digest.to_dict()
+        return data
+
+
+@dataclass(frozen=True)
+class SelfContextResult:
+    """Parsed context-window telemetry from the calling pane's statusline."""
+
+    workspace_id: str
+    tab_id: str
+    pane_id: str
+    agent_kind: str | None
+    source: str
+    parsed: bool
+    model_display: str | None
+    ctx_percent: int | None
+    tokens_used: int | None
+    tokens_limit: int | None
+    tokens_display: str | None
+    rate_limits: dict[str, Any]
+    statusline: str | None
+    rotate_ctx: int | None = None
+    should_rotate: bool | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RotateResult:
+    """Result of initiating or acknowledging a 2-phase same-tab pane rotation."""
+
+    mode: str  # "rotate" | "ack"
+    dry_run: bool
+    workspace_id: str
+    tab_id: str
+    old_pane_id: str
+    new_pane_id: str | None
+    launcher: str | None
+    agent_kind: str | None
+    agent_status: str | None
+    generation: int
+    status: str  # "dry_run" | "pending_ack" | "completed"
+    handoff_json_path: str | None
+    handoff_md_path: str | None
+    old_pane_closed: bool = False
+    prompt_sent: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)

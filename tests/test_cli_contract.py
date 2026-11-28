@@ -19,10 +19,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 class MockHerdrServer:
     """Minimal AF_UNIX JSON-lines Herdr server for CLI contract testing."""
 
-    def __init__(self, socket_path: Path, snapshot: dict, *, emit_done_event: bool = False) -> None:
+    def __init__(
+        self,
+        socket_path: Path,
+        snapshot: dict,
+        *,
+        emit_done_event: bool = False,
+        read_texts: dict[tuple[str, str], str] | None = None,
+        custom_events: list[dict] | None = None,
+    ) -> None:
         self.socket_path = socket_path
         self.snapshot = snapshot
         self.emit_done_event = emit_done_event
+        self.read_texts = read_texts or {}
+        self.custom_events = custom_events
         self._stop = threading.Event()
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.bind(str(socket_path))
@@ -73,10 +83,14 @@ class MockHerdrServer:
                     }
                     conn.sendall((json.dumps(resp) + "\n").encode())
                     return
-                text = (
+                default_text = (
                     "────────\n❯ \n────────\n⏵⏵ bypass on · 1 background agent"
                     if source == "detection" and target == "w6:p2"
                     else "Mock agent output line"
+                )
+                text = self.read_texts.get(
+                    (target, source),
+                    self.read_texts.get((target, "*"), default_text),
                 )
                 resp = {
                     "id": req_id,
@@ -86,7 +100,23 @@ class MockHerdrServer:
             elif method == "events.subscribe":
                 ack = {"id": req_id, "result": {"type": "subscription_started"}}
                 conn.sendall((json.dumps(ack) + "\n").encode())
-                if self.emit_done_event:
+                if self.custom_events:
+                    for item in self.custom_events:
+                        time.sleep(0.03)
+                        for p in self.snapshot["panes"]:
+                            if p["pane_id"] == item.get("pane_id") and "agent_status" in item:
+                                p["agent_status"] = item["agent_status"]
+                                p["revision"] = int(p.get("revision") or 0) + 1
+                        for a in self.snapshot["agents"]:
+                            if a["pane_id"] == item.get("pane_id") and "agent_status" in item:
+                                a["agent_status"] = item["agent_status"]
+                                a["revision"] = int(a.get("revision") or 0) + 1
+                        for t in self.snapshot["tabs"]:
+                            if t["tab_id"] == item.get("tab_id") and "agent_status" in item:
+                                t["agent_status"] = item["agent_status"]
+                        ev = {"event": item.get("event", "pane.agent_status_changed"), "data": item}
+                        conn.sendall((json.dumps(ev) + "\n").encode())
+                elif self.emit_done_event:
                     time.sleep(0.05)
                     for p in self.snapshot["panes"]:
                         if p["pane_id"] == "w6:p2":
@@ -107,6 +137,8 @@ def run_cli(
     stdin_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     merged_env = dict(os.environ)
+    merged_env.pop("HERDR_TAB_ROLE", None)
+    merged_env.pop("HERDR_PANE_ROLE", None)
     merged_env["PYTHONPATH"] = str(REPO_ROOT / "src")
     if env:
         merged_env.update(env)
@@ -653,6 +685,215 @@ class CliContractTests(unittest.TestCase):
         self.assertFalse(ns_tab.auto_trust)
         self.assertFalse(ns_pane.auto_trust)
         self.assertTrue(parser.parse_args(["ensure", "--ticket", "CBRD-10001"]).auto_trust)
+
+    def test_digest_since_last_compact_and_cursor_flags(self) -> None:
+        snapshot = copy.deepcopy(json.loads(FIXTURE_PATH.read_text(encoding="utf-8")))
+        for p in snapshot["panes"]:
+            if p["pane_id"] == "w6:p2":
+                p["agent_status"] = "working"
+        for a in snapshot["agents"]:
+            if a["pane_id"] == "w6:p2":
+                a["agent_status"] = "working"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            live_dir = tmp_path / "live-repo"
+            live_dir.mkdir()
+            for item in (*snapshot["panes"], *snapshot["agents"]):
+                if item["workspace_id"] != "w3":
+                    item["cwd"] = str(live_dir)
+                    if "foreground_cwd" in item:
+                        item["foreground_cwd"] = str(live_dir)
+            sock_path = tmp_path / "herdr.sock"
+            env = {
+                "HERDR_WORKSPACE_ID": "w4",
+                "XDG_STATE_HOME": str(tmp_path / "state"),
+            }
+            with MockHerdrServer(sock_path, snapshot) as srv:
+                run1 = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "digest",
+                        "--since-last",
+                        "--cursor",
+                        "test-slot",
+                        "--compact",
+                        "--no-tracker",
+                        "--json",
+                    ],
+                    env=env,
+                )
+                self.assertEqual(run1.returncode, 0, run1.stderr)
+                d1 = json.loads(run1.stdout)["data"]
+                self.assertTrue(d1["since_last"])
+                self.assertTrue(d1["compact"])
+                self.assertTrue(d1["changed"])
+                self.assertEqual(d1["count"], 1)
+
+                # 2nd run with no changes -> changed=False and still_blocked populated.
+                run2 = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "digest",
+                        "--since-last",
+                        "--cursor",
+                        "test-slot",
+                        "--compact",
+                        "--no-tracker",
+                        "--json",
+                    ],
+                    env=env,
+                )
+                self.assertEqual(run2.returncode, 0, run2.stderr)
+                d2 = json.loads(run2.stdout)["data"]
+                self.assertFalse(d2["changed"])
+                self.assertEqual(d2["entries"], [])
+                self.assertEqual(len(d2["still_blocked"]), 1)
+
+                # Transition w6 working -> idle, preview with --no-advance, then consume.
+                for p in srv.snapshot["panes"]:
+                    if p["pane_id"] == "w6:p2":
+                        p["agent_status"] = "idle"
+                        p["revision"] = 601
+                for a in srv.snapshot["agents"]:
+                    if a["pane_id"] == "w6:p2":
+                        a["agent_status"] = "idle"
+                        a["revision"] = 601
+
+                preview = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "digest",
+                        "--since-last",
+                        "--cursor",
+                        "test-slot",
+                        "--no-advance",
+                        "--no-verify-busy",
+                        "--no-tracker",
+                        "--json",
+                    ],
+                    env=env,
+                )
+                self.assertEqual(preview.returncode, 0, preview.stderr)
+                dp = json.loads(preview.stdout)["data"]
+                self.assertTrue(dp["changed"])
+                self.assertEqual(dp["entries"][0]["workspace"]["workspace_id"], "w6")
+                self.assertEqual(dp["entries"][0]["change_reason"], "settled_idle")
+
+                # Because preview used --no-advance, the next advancing call still sees w6!
+                consume = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "digest",
+                        "--since-last",
+                        "--cursor",
+                        "test-slot",
+                        "--no-verify-busy",
+                        "--no-tracker",
+                        "--json",
+                    ],
+                    env=env,
+                )
+                self.assertEqual(consume.returncode, 0, consume.stderr)
+                dc = json.loads(consume.stdout)["data"]
+                self.assertTrue(dc["changed"])
+                self.assertEqual(dc["entries"][0]["workspace"]["workspace_id"], "w6")
+
+                # Reset cursor restores initial baseline behavior.
+                reset = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "digest",
+                        "--since-last",
+                        "--cursor",
+                        "test-slot",
+                        "--reset-cursor",
+                        "--no-tracker",
+                        "--json",
+                    ],
+                    env=env,
+                )
+                self.assertEqual(reset.returncode, 0, reset.stderr)
+                dr = json.loads(reset.stdout)["data"]
+                self.assertEqual(dr["entries"][0]["change_reason"], "initial")
+
+    def test_wait_since_last_subtabs_and_self_context_via_socket(self) -> None:
+        snapshot = copy.deepcopy(json.loads(FIXTURE_PATH.read_text(encoding="utf-8")))
+        for p in snapshot["panes"]:
+            if p["pane_id"] == "w1:p4":
+                p["agent_status"] = "working"
+        for a in snapshot["agents"]:
+            if a["pane_id"] == "w1:p4":
+                a["agent_status"] = "working"
+        for t in snapshot["tabs"]:
+            if t["tab_id"] == "w1:t4":
+                t["agent_status"] = "working"
+
+        status_text = (
+            "Orchestrator (Neon) [bypass] │ ~/gh/herdr-commander (feat) │ "
+            "ctx ██░░░░░░░░ 18% 180k/1.0M │ gemini-5h 82% ·2h50m │ gemini-7d 70% ·4d"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            sock_path = tmp_path / "herdr.sock"
+            env = {
+                "HERDR_WORKSPACE_ID": "w4",
+                "HERDR_TAB_ID": "w4:t1",
+                "HERDR_PANE_ID": "w4:p1",
+                "XDG_STATE_HOME": str(tmp_path / "state"),
+            }
+            events = [{"pane_id": "w1:p4", "tab_id": "w1:t4", "agent_status": "blocked"}]
+            with MockHerdrServer(
+                sock_path,
+                snapshot,
+                read_texts={("w4:p1", "visible"): status_text},
+                custom_events=events,
+            ):
+                ctx_proc = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "self-context",
+                        "--rotate-ctx",
+                        "15",
+                        "--json",
+                    ],
+                    env=env,
+                )
+                self.assertEqual(ctx_proc.returncode, 0, ctx_proc.stderr)
+                ctx_data = json.loads(ctx_proc.stdout)["data"]
+                self.assertTrue(ctx_data["parsed"])
+                self.assertEqual(ctx_data["ctx_percent"], 18)
+                self.assertTrue(ctx_data["should_rotate"])
+
+                wait_proc = run_cli(
+                    [
+                        "--socket",
+                        str(sock_path),
+                        "wait",
+                        "--since-last",
+                        "--cursor",
+                        "watch-slot",
+                        "--include-subtabs",
+                        "--emit-digest",
+                        "--compact",
+                        "--allow-timeout",
+                        "--timeout",
+                        "2",
+                        "--json",
+                    ],
+                    env=env,
+                )
+                self.assertEqual(wait_proc.returncode, 0, wait_proc.stderr)
+                w_data = json.loads(wait_proc.stdout)["data"]
+                self.assertEqual(w_data["reason"], "changed")
+                self.assertFalse(w_data["timed_out"])
+                self.assertEqual(w_data["digest"]["entries"][0]["change_reason"], "subtab_blocked")
 
 
 if __name__ == "__main__":

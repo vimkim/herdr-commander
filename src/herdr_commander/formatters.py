@@ -21,6 +21,8 @@ from .models import (
     PaneSpawnResult,
     PaneWaitResult,
     PeekResult,
+    RotateResult,
+    SelfContextResult,
     SendResult,
     SpaceSnapshot,
     TabCloseResult,
@@ -451,20 +453,19 @@ def format_digest(
         for entry in result.entries:
             space = entry.space
             pane = space.primary_pane
-            rows.append(
-                "\t".join(
-                    (
-                        space.workspace_id,
-                        space.attention,
-                        pane.agent_kind or "shell" if pane else "-",
-                        _sub_tab_badge(space),
-                        space.ticket_key or "-",
-                        ",".join(str(i) for i in space.work_item_ids) or "-",
-                        space.label,
-                        str(len(entry.peeks)),
-                    )
-                )
-            )
+            cols = [
+                space.workspace_id,
+                space.attention,
+                pane.agent_kind or "shell" if pane else "-",
+                _sub_tab_badge(space),
+                space.ticket_key or "-",
+                ",".join(str(i) for i in space.work_item_ids) or "-",
+                space.label,
+                str(len(entry.peeks)),
+            ]
+            if result.since_last:
+                cols.append(entry.change_reason or "-")
+            rows.append("\t".join(cols))
         return "\n".join(rows)
 
     summary_bits = [f"{k}={v}" for k, v in result.counts.items() if v]
@@ -476,8 +477,28 @@ def format_digest(
         else f"Workers: {result.total_workspaces}"
     )
     if result.total_workspaces == 0:
+        if result.since_last and result.closed_workspaces:
+            closed_str = ", ".join(
+                f"{item['workspace_id']} ({item['label']})" for item in result.closed_workspaces
+            )
+            return f"{header_line}\nClosed: {closed_str}"
         return f"{header_line}\nNo matching Herdr workspaces."
+
+    if result.since_last and not result.changed and not result.entries:
+        extra_lines = [f"No changes ({header_line})"]
+        if result.still_blocked:
+            blocked_str = ", ".join(
+                f"{item['workspace_id']} ({item['label']})" for item in result.still_blocked
+            )
+            extra_lines.append(f"Still blocked: {blocked_str}")
+        return "\n".join(extra_lines)
+
     if not result.entries:
+        if result.closed_workspaces:
+            closed_str = ", ".join(
+                f"{item['workspace_id']} ({item['label']})" for item in result.closed_workspaces
+            )
+            return f"{header_line}\nClosed: {closed_str}"
         return f"{header_line}\nNo workspaces currently need attention."
 
     lines = [header_line]
@@ -490,10 +511,12 @@ def format_digest(
         attn_text = _colorize(f"{space.attention:<8}", space.attention, mode)
         tracker_str = ",".join(f"#{i}" for i in space.work_item_ids) if space.work_item_ids else "-"
         cwd_str = _shorten_path(pane.cwd) if pane else "-"
+        reason_suffix = f"  [{entry.change_reason}]" if entry.change_reason else ""
         lines.append("")
         lines.append(
             f"{space.workspace_id:<5}  {attn_text}  {agent_str:<9}  "
             f"{_sub_tab_badge(space):<14}  {tracker_str:<10}  {space.label:<24}  {cwd_str}"
+            f"{reason_suffix}"
         )
         for peek in entry.peeks:
             if peek.is_primary:
@@ -508,6 +531,17 @@ def format_digest(
                     lines.append(f"    {body_line}")
             else:
                 lines.append("    (empty)")
+    if result.still_blocked:
+        blocked_str = ", ".join(
+            f"{item['workspace_id']} ({item['label']})" for item in result.still_blocked
+        )
+        lines.append("")
+        lines.append(f"Still blocked: {blocked_str}")
+    if result.closed_workspaces:
+        closed_str = ", ".join(
+            f"{item['workspace_id']} ({item['label']})" for item in result.closed_workspaces
+        )
+        lines.append(f"Closed: {closed_str}")
     return "\n".join(lines)
 
 
@@ -516,6 +550,12 @@ def format_wait(result: WaitResult, mode: OutputMode) -> str:
     if mode.fmt == "json":
         return format_json_success(result.to_dict())
     if mode.fmt == "plain":
+        if result.digest is not None and result.reason in {
+            "changed",
+            "no_active_work",
+            "timeout",
+        }:
+            return format_digest(result.digest, mode)
         return "\n".join(
             "\t".join(
                 (
@@ -527,13 +567,28 @@ def format_wait(result: WaitResult, mode: OutputMode) -> str:
             )
             for s in result.matched
         )
-    lines = [
-        f"Matched {len(result.matched)} workspace(s) for [{', '.join(result.until)}] "
-        f"in {result.elapsed_seconds:.2f}s:"
-    ]
+
+    if result.reason == "no_active_work":
+        lines = [f"No active worker agents remaining ({result.elapsed_seconds:.2f}s)."]
+    elif result.timed_out:
+        lines = [f"Wait timed out after {result.elapsed_seconds:.2f}s (no matching changes)."]
+    elif result.reason == "changed":
+        lines = [
+            f"Detected changes in {len(result.matched)} workspace(s) "
+            f"in {result.elapsed_seconds:.2f}s:"
+        ]
+    else:
+        lines = [
+            f"Matched {len(result.matched)} workspace(s) for [{', '.join(result.until)}] "
+            f"in {result.elapsed_seconds:.2f}s:"
+        ]
+
     for s in result.matched:
         pid = s.primary_pane.pane_id if s.primary_pane else "-"
         lines.append(f"  {s.workspace_id}  {s.attention:<8}  {pid}  {s.label}")
+    if result.digest is not None:
+        lines.append("")
+        lines.append(format_digest(result.digest, mode))
     return "\n".join(lines)
 
 
@@ -804,3 +859,72 @@ def format_pane_close(result: PaneCloseResult, mode: OutputMode) -> str:
         return "\t".join(("dry-run" if result.dry_run else "closed", result.tab_id, result.pane_id))
     prefix = "[dry-run] " if result.dry_run else ""
     return f"{prefix}Closed worker pane {result.pane_id} in {result.tab_id}"
+
+
+def format_self_context(result: SelfContextResult, mode: OutputMode) -> str:
+    """Render `self-context` output."""
+    if mode.fmt == "json":
+        return format_json_success(result.to_dict())
+    if mode.fmt == "plain":
+        return "\t".join(
+            (
+                result.workspace_id,
+                result.pane_id,
+                result.agent_kind or "shell",
+                "true" if result.parsed else "false",
+                str(result.ctx_percent) if result.ctx_percent is not None else "-",
+                result.tokens_display or "-",
+                (
+                    "true"
+                    if result.should_rotate
+                    else ("false" if result.should_rotate is False else "-")
+                ),
+            )
+        )
+    if not result.parsed:
+        return (
+            f"Self context ({result.workspace_id}, {result.pane_id}, "
+            f"{result.agent_kind or 'shell'}): statusline not detected in {result.source}."
+        )
+    parts = [f"ctx {result.ctx_percent}%"]
+    if result.tokens_display:
+        parts.append(result.tokens_display)
+    if result.model_display:
+        parts.append(result.model_display)
+    if result.should_rotate is not None:
+        parts.append(
+            f"rotate={'YES' if result.should_rotate else 'no'} (threshold={result.rotate_ctx}%)"
+        )
+    return f"Self context ({result.workspace_id}, {result.pane_id}): " + " | ".join(parts)
+
+
+def format_rotate(result: RotateResult, mode: OutputMode) -> str:
+    """Render `rotate` output."""
+    if mode.fmt == "json":
+        return format_json_success(result.to_dict())
+    if mode.fmt == "plain":
+        return "\t".join(
+            (
+                result.mode,
+                result.status,
+                result.workspace_id,
+                result.tab_id,
+                result.old_pane_id,
+                result.new_pane_id or "-",
+                str(result.generation),
+                "true" if result.old_pane_closed else "false",
+            )
+        )
+    prefix = "[dry-run] " if result.dry_run else ""
+    if result.mode == "ack":
+        closed_note = "closed" if result.old_pane_closed else "already closed/dry-run"
+        return (
+            f"{prefix}Rotation ACK complete in {result.tab_id} (gen {result.generation}): "
+            f"successor={result.new_pane_id}, retired={result.old_pane_id} ({closed_note})"
+        )
+    return (
+        f"{prefix}Rotation initiated in {result.tab_id} (gen {result.generation}): "
+        f"{result.old_pane_id} -> {result.new_pane_id or 'new'} "
+        f"({result.agent_kind or result.launcher}:{result.agent_status or 'pending'}), "
+        f"handoff={result.handoff_md_path}"
+    )

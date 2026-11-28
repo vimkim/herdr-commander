@@ -21,6 +21,8 @@ from .formatters import (
     format_pane_spawn,
     format_pane_wait,
     format_peek,
+    format_rotate,
+    format_self_context,
     format_send,
     format_status,
     format_tab_close,
@@ -34,17 +36,28 @@ from .formatters import (
 from .herdr_client import (
     HerdrSocketClient,
     agent_prompt,
+    agent_send_keys,
     agent_start,
     ai_agent_select_backend,
     create_workspace_cubrid_pr,
     create_workspace_cubrid_ticket,
     create_workspace_cwd,
+    delete_digest_cursor,
     ensure_trusted_workspace,
     fetch_work_tracker_items,
+    load_digest_cursor,
+    load_handoff_state,
     pane_close,
     pane_run,
     pane_split,
+    read_recent_audit_lines,
+    resolve_cursor_path,
+    resolve_cursor_scope,
+    resolve_handoff_paths,
     resolve_socket_path,
+    resolve_state_dir,
+    save_digest_cursor,
+    save_handoff_state,
     tab_close,
     tab_create,
     workspace_env_overrides,
@@ -54,6 +67,8 @@ from .models import (
     DEFAULT_MAX_SPACE_AGENTS,
     DEFAULT_MAX_SUB_TABS,
     DEFAULT_MAX_WORKER_PANES,
+    DEFAULT_ROTATE_COOLDOWN,
+    DEFAULT_ROTATE_CTX,
     DEFAULT_WAIT_STATES,
     EXIT_DOMAIN,
     EXIT_OK,
@@ -66,24 +81,28 @@ from .models import (
     CliError,
     PaneInfo,
     PeekResult,
+    SelfContextResult,
 )
 from .orchestrate import (
     LAUNCHERS,
     TrustWorkspaceFn,
-    execute_digest,
+    execute_digest_with_cursor,
     execute_ensure,
     execute_pane_close,
     execute_pane_send,
     execute_pane_spawn,
     execute_pane_wait,
+    execute_rotate,
+    execute_rotate_ack,
     execute_send,
     execute_tab_close,
     execute_tab_send,
     execute_tab_spawn,
     execute_tab_wait,
-    execute_wait,
+    execute_wait_with_cursor,
     plan_ensure,
     plan_pane_spawn,
+    plan_rotate,
     plan_tab_spawn,
     verify_tabs_claude_busy,
 )
@@ -95,6 +114,7 @@ from .snapshot import (
     count_session_working_agents,
     filter_spaces,
     find_matching_spaces,
+    parse_self_context_statusline,
     parse_snapshot,
     parse_workspace_tabs,
     resolve_caller_context,
@@ -271,6 +291,43 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include all watched workspaces instead of only blocked/done/blocked-subtabs",
     )
+    p_digest.add_argument(
+        "--include-idle",
+        action="store_true",
+        help="Include idle agent workspaces (and peek them) in non-delta or initial baseline runs",
+    )
+    p_digest.add_argument(
+        "--since-last",
+        action="store_true",
+        help="Only surface workspaces changed since the persisted cursor (including working->idle)",
+    )
+    p_digest.add_argument(
+        "--cursor",
+        default=None,
+        metavar="NAME",
+        help="Named cursor slot for --since-last (default: scoped by socket + caller workspace)",
+    )
+    p_digest.add_argument(
+        "--no-advance",
+        action="store_true",
+        help="Read --since-last delta without updating the persisted cursor",
+    )
+    p_digest.add_argument(
+        "--reset-cursor",
+        action="store_true",
+        help="Delete the persisted cursor for this scope before running",
+    )
+    p_digest.add_argument(
+        "--compact",
+        action="store_true",
+        help="Emit compact workspace metadata and bounded reporting-tail peeks",
+    )
+    p_digest.add_argument(
+        "--max-peek-chars",
+        type=int,
+        default=None,
+        help="Bound each peek snippet to at most N characters (default under --compact: 1500)",
+    )
     p_digest.add_argument("--workspace", help="Digest one workspace ID, label, or ticket")
     p_digest.add_argument(
         "--include-self",
@@ -294,8 +351,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_digest.add_argument(
         "--peek-lines",
         type=int,
-        default=40,
-        help="Lines to peek for attention/target workspaces (default: 40, 0 disables)",
+        default=None,
+        help=(
+            "Lines to peek for attention/target workspaces "
+            "(default: 40, or 20 with --compact; 0 disables)"
+        ),
     )
     p_digest.add_argument(
         "--source",
@@ -362,6 +422,75 @@ def build_parser() -> argparse.ArgumentParser:
         "--verify-busy",
         action="store_true",
         help="Apply Claude background-busy verification before matching",
+    )
+    p_wait.add_argument(
+        "--since-last",
+        action="store_true",
+        help="Wait for state/output transitions relative to persisted digest cursor",
+    )
+    p_wait.add_argument(
+        "--cursor",
+        default=None,
+        metavar="NAME",
+        help="Named cursor slot when --since-last is enabled",
+    )
+    p_wait.add_argument(
+        "--no-advance",
+        action="store_true",
+        help="Do not update the persisted cursor on --since-last completion",
+    )
+    p_wait.add_argument(
+        "--changes-only",
+        action="store_true",
+        help="Ignore already-settled workspaces at startup and wake only on new transitions",
+    )
+    p_wait.add_argument(
+        "--include-subtabs",
+        action="store_true",
+        help="Watch all sub-tab/split panes in addition to Tab 1 and wake on blocked sub-tabs",
+    )
+    p_wait.add_argument(
+        "--stop-when-idle",
+        action="store_true",
+        help="Exit immediately (reason=no_active_work) when no watched agent is working/busy_bg",
+    )
+    p_wait.add_argument(
+        "--allow-timeout",
+        action="store_true",
+        help="Return exit code 0 with timed_out=true instead of WAIT_TIMEOUT error on timeout",
+    )
+    p_wait.add_argument(
+        "--emit-digest",
+        action="store_true",
+        help="Attach a delta/attention digest payload when waking up",
+    )
+    p_wait.add_argument(
+        "--compact",
+        action="store_true",
+        help="Use compact mode for the embedded --emit-digest payload",
+    )
+    p_wait.add_argument(
+        "--peek-lines",
+        type=int,
+        default=None,
+        help="Lines to peek when --emit-digest or --since-last is enabled",
+    )
+    p_wait.add_argument(
+        "--max-peek-chars",
+        type=int,
+        default=None,
+        help="Max characters per peek in embedded --emit-digest output",
+    )
+    p_wait.add_argument(
+        "--source",
+        choices=("visible", "recent", "recent-unwrapped", "detection"),
+        default="recent-unwrapped",
+        help="Herdr read source for embedded digest (default: recent-unwrapped)",
+    )
+    p_wait.add_argument(
+        "--with-tracker",
+        action="store_true",
+        help="Correlate watched workspaces with open work-tracker items for embedded digest",
     )
 
     p_ensure = subparsers.add_parser(
@@ -785,6 +914,111 @@ def build_parser() -> argparse.ArgumentParser:
         help="Validate without closing pane",
     )
 
+    p_self_ctx = subparsers.add_parser(
+        "self-context",
+        parents=[common],
+        help="Inspect the calling pane's statusline context percentage and token telemetry",
+    )
+    p_self_ctx.add_argument(
+        "--rotate-ctx",
+        type=int,
+        default=None,
+        help="Optional context percentage threshold (1-100) to compute should_rotate",
+    )
+    p_self_ctx.add_argument(
+        "--lines",
+        type=int,
+        default=15,
+        help="Terminal lines to read from the calling pane (default: 15)",
+    )
+
+    p_rotate = subparsers.add_parser(
+        "rotate",
+        parents=[common],
+        help="2-phase same-tab Commander pane rotation with handoff state and --ack retirement",
+    )
+    p_rotate.add_argument(
+        "--ack",
+        default=None,
+        metavar="PANE_ID",
+        help="Phase 2: acknowledge takeover from successor pane and close the old pane",
+    )
+    p_rotate.add_argument(
+        "--launcher",
+        default="ay",
+        choices=tuple(LAUNCHERS.keys()),
+        help="Successor pane agent launcher (default: ay)",
+    )
+    p_rotate.add_argument(
+        "--direction",
+        default="right",
+        choices=VALID_SPLIT_DIRECTIONS,
+        help="Pane split direction inside caller tab (default: right)",
+    )
+    p_rotate.add_argument(
+        "--cooldown",
+        type=float,
+        default=DEFAULT_ROTATE_COOLDOWN,
+        help=f"Minimum seconds between rotations (default: {int(DEFAULT_ROTATE_COOLDOWN)})",
+    )
+    p_rotate.add_argument(
+        "--rotate-ctx",
+        type=int,
+        default=DEFAULT_ROTATE_CTX,
+        help=f"Threshold propagated into handoff for /hcmd-auto (default: {DEFAULT_ROTATE_CTX})",
+    )
+    p_rotate.add_argument(
+        "--cursor",
+        default=None,
+        metavar="NAME",
+        help="Digest cursor name carried in handoff state",
+    )
+    p_rotate.add_argument(
+        "--auto-config",
+        default=None,
+        help="Optional /hcmd-auto policy/config summary recorded in handoff",
+    )
+    p_rotate.add_argument(
+        "--decision",
+        action="append",
+        default=[],
+        help="Pending human decision to record in handoff (repeatable)",
+    )
+    p_rotate.add_argument(
+        "--note",
+        default=None,
+        help="Optional freeform handoff note for the successor pane",
+    )
+    p_rotate.add_argument(
+        "--ready-timeout",
+        type=float,
+        default=45.0,
+        help="Seconds to wait for successor agent startup readiness (default: 45)",
+    )
+    p_rotate.add_argument(
+        "--verify-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to verify successor accepted bootstrap prompt (default: 10)",
+    )
+    p_rotate.add_argument(
+        "--no-trust",
+        dest="auto_trust",
+        action="store_false",
+        default=True,
+        help="Skip pre-trusting the workspace directory before launch",
+    )
+    p_rotate.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass rotation cooldown or handoff matching guards",
+    )
+    p_rotate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate rotation plan or ACK without splitting or closing panes",
+    )
+
     parser._subcommand_help_map = {"tab": p_tab, "pane": p_pane}  # type: ignore[attr-defined]
     return parser
 
@@ -984,17 +1218,47 @@ def _dispatch(
         return format_find(result, mode, warnings=warnings)
 
     if cmd == "digest":
-        if ns.peek_lines < 0:
+        if ns.no_advance and not ns.since_last:
+            raise CliError(
+                "INVALID_FLAGS",
+                "--no-advance requires --since-last.",
+                "Add `--since-last` or remove `--no-advance`.",
+                exit_code=EXIT_USAGE,
+            )
+        peek_lines = ns.peek_lines if ns.peek_lines is not None else (20 if ns.compact else 40)
+        if peek_lines < 0:
             raise CliError(
                 "INVALID_LINES",
                 "--peek-lines must be 0 or a positive integer.",
                 "Pass e.g. `--peek-lines 40` or `--peek-lines 0`.",
                 exit_code=EXIT_USAGE,
             )
+        if ns.max_peek_chars is not None and ns.max_peek_chars <= 0:
+            raise CliError(
+                "INVALID_MAX_PEEK_CHARS",
+                "--max-peek-chars must be a positive integer.",
+                "Pass e.g. `--max-peek-chars 1500`.",
+                exit_code=EXIT_USAGE,
+            )
+
+        cursor_scope = resolve_cursor_scope(client.socket_path, self_workspace_id, ns.cursor)
+        state_dir = resolve_state_dir(env)
+        cursor_path = resolve_cursor_path(state_dir, cursor_scope)
+        if ns.reset_cursor:
+            delete_digest_cursor(cursor_path)
+
+        prev_cursor = None
+        warnings: list[str] = []
+        if ns.since_last:
+            prev_cursor, cursor_warn = load_digest_cursor(cursor_path)
+            if cursor_warn:
+                warnings.append(cursor_warn)
+                if mode.fmt != "json":
+                    sys.stderr.write(f"Warning: {cursor_warn}\n")
+
         spaces = parse_snapshot(client.snapshot(), self_workspace_id=self_workspace_id)
         if ns.verify_busy:
             spaces = verify_claude_busy(spaces, client.read_detection)
-        warnings: list[str] = []
         if ns.with_tracker:
             items, warn = fetch_work_tracker_items()
             if warn:
@@ -1008,14 +1272,22 @@ def _dispatch(
             workspace=ns.workspace,
             sort="attention",
         )
-        result, digest_warnings = execute_digest(
+        result, next_cursor, digest_warnings = execute_digest_with_cursor(
             filtered,
             read_pane=client.read_pane,
             include_all=bool(ns.all),
+            include_idle=bool(ns.include_idle),
             workspace=ns.workspace,
-            peek_lines=ns.peek_lines,
+            peek_lines=peek_lines,
             peek_source=ns.source,
+            compact=bool(ns.compact),
+            max_peek_chars=ns.max_peek_chars,
+            since_last=bool(ns.since_last),
+            prev_cursor=prev_cursor,
+            cursor_scope=cursor_scope,
         )
+        if ns.since_last and not ns.no_advance:
+            save_digest_cursor(cursor_path, next_cursor)
         for warn in digest_warnings:
             warnings.append(warn)
             if mode.fmt != "json":
@@ -1070,8 +1342,47 @@ def _dispatch(
                 "Pass e.g. `--timeout 300`.",
                 exit_code=EXIT_USAGE,
             )
+        if ns.no_advance and not ns.since_last:
+            raise CliError(
+                "INVALID_FLAGS",
+                "--no-advance requires --since-last.",
+                "Add `--since-last` or remove `--no-advance`.",
+                exit_code=EXIT_USAGE,
+            )
+        peek_lines = ns.peek_lines if ns.peek_lines is not None else (20 if ns.compact else 40)
+        if peek_lines < 0:
+            raise CliError(
+                "INVALID_LINES",
+                "--peek-lines must be 0 or a positive integer.",
+                "Pass e.g. `--peek-lines 20` or `--peek-lines 0`.",
+                exit_code=EXIT_USAGE,
+            )
+        if ns.max_peek_chars is not None and ns.max_peek_chars <= 0:
+            raise CliError(
+                "INVALID_MAX_PEEK_CHARS",
+                "--max-peek-chars must be a positive integer.",
+                "Pass e.g. `--max-peek-chars 1500`.",
+                exit_code=EXIT_USAGE,
+            )
+
         until = _parse_until(ns.until)
-        result = execute_wait(
+        cursor_scope = resolve_cursor_scope(client.socket_path, self_workspace_id, ns.cursor)
+        state_dir = resolve_state_dir(env)
+        cursor_path = resolve_cursor_path(state_dir, cursor_scope)
+        prev_cursor = None
+        if ns.since_last:
+            prev_cursor, cursor_warn = load_digest_cursor(cursor_path)
+            if cursor_warn and mode.fmt != "json":
+                sys.stderr.write(f"Warning: {cursor_warn}\n")
+
+        tracker_items: list[dict[str, object]] = []
+        if ns.with_tracker:
+            loaded_items, warn = fetch_work_tracker_items()
+            if warn and mode.fmt != "json":
+                sys.stderr.write(f"Warning: {warn}\n")
+            tracker_items = loaded_items
+
+        result, next_cursor, wait_warnings = execute_wait_with_cursor(
             client=client,
             until=until,
             workspace=ns.workspace,
@@ -1079,7 +1390,26 @@ def _dispatch(
             timeout=float(ns.timeout),
             verify_busy=bool(ns.verify_busy),
             self_workspace_id=self_workspace_id,
+            since_last=bool(ns.since_last),
+            prev_cursor=prev_cursor,
+            cursor_scope=cursor_scope,
+            changes_only=bool(ns.changes_only),
+            include_subtabs=bool(ns.include_subtabs),
+            stop_when_idle=bool(ns.stop_when_idle),
+            allow_timeout=bool(ns.allow_timeout),
+            emit_digest=bool(ns.emit_digest),
+            compact=bool(ns.compact),
+            peek_lines=peek_lines,
+            peek_source=ns.source,
+            max_peek_chars=ns.max_peek_chars,
+            read_pane=getattr(client, "read_pane", None),
+            tracker_items=tracker_items,
         )
+        if ns.since_last and not ns.no_advance and next_cursor is not None:
+            save_digest_cursor(cursor_path, next_cursor)
+        if mode.fmt != "json":
+            for warn in wait_warnings:
+                sys.stderr.write(f"Warning: {warn}\n")
         return format_wait(result, mode)
 
     if cmd == "ensure":
@@ -1119,6 +1449,8 @@ def _dispatch(
             env=env,
             select_backend=ai_agent_select_backend,
             trust_workspace=_make_trust_callback(bool(ns.auto_trust), mode),
+            read_pane=getattr(client, "read_pane", None),
+            send_keys=agent_send_keys,
             self_workspace_id=self_workspace_id,
             dry_run=bool(ns.dry_run),
             ready_timeout=float(ns.ready_timeout),
@@ -1149,6 +1481,156 @@ def _dispatch(
             prompt_fn=agent_prompt,
         )
         return format_send(result, mode)
+
+    if cmd == "self-context":
+        if ns.lines <= 0:
+            raise CliError(
+                "INVALID_LINES",
+                "--lines must be a positive integer.",
+                "Pass e.g. `--lines 15`.",
+                exit_code=EXIT_USAGE,
+            )
+        if ns.rotate_ctx is not None and not (1 <= ns.rotate_ctx <= 100):
+            raise CliError(
+                "INVALID_ROTATE_CTX",
+                f"--rotate-ctx must be between 1 and 100, got {ns.rotate_ctx}.",
+                "Pass e.g. `--rotate-ctx 30`.",
+                exit_code=EXIT_USAGE,
+            )
+        raw_snap = client.snapshot()
+        caller = resolve_caller_context(raw_snap, env)
+        tabs = parse_workspace_tabs(
+            raw_snap,
+            caller.workspace_id,
+            self_tab_id=caller.tab_id,
+            self_pane_id=caller.pane_id,
+        )
+        caller_tab = next(t for t in tabs if t.tab_id == caller.tab_id)
+        caller_pane = next(p for p in caller_tab.panes if p.pane_id == caller.pane_id)
+
+        source_used = "visible"
+        read = client.read_pane(
+            caller.pane_id,
+            has_agent=caller_pane.agent_kind is not None,
+            source="visible",
+            lines=ns.lines,
+        )
+        parsed_ctx = parse_self_context_statusline(str(read["text"]))
+        if not parsed_ctx["parsed"]:
+            recent_read = client.read_pane(
+                caller.pane_id,
+                has_agent=caller_pane.agent_kind is not None,
+                source="recent",
+                lines=max(ns.lines, 25),
+            )
+            recent_parsed = parse_self_context_statusline(str(recent_read["text"]))
+            if recent_parsed["parsed"]:
+                parsed_ctx = recent_parsed
+                source_used = "recent"
+
+        should_rotate: bool | None = None
+        if ns.rotate_ctx is not None:
+            should_rotate = bool(
+                parsed_ctx["parsed"]
+                and parsed_ctx["ctx_percent"] is not None
+                and parsed_ctx["ctx_percent"] >= ns.rotate_ctx
+            )
+
+        return format_self_context(
+            SelfContextResult(
+                workspace_id=caller.workspace_id,
+                tab_id=caller.tab_id,
+                pane_id=caller.pane_id,
+                agent_kind=caller_pane.agent_kind,
+                source=source_used,
+                parsed=bool(parsed_ctx["parsed"]),
+                model_display=parsed_ctx["model_display"],
+                ctx_percent=parsed_ctx["ctx_percent"],
+                tokens_used=parsed_ctx["tokens_used"],
+                tokens_limit=parsed_ctx["tokens_limit"],
+                tokens_display=parsed_ctx["tokens_display"],
+                rate_limits=parsed_ctx["rate_limits"],
+                statusline=parsed_ctx["statusline"],
+                rotate_ctx=ns.rotate_ctx,
+                should_rotate=should_rotate,
+            ),
+            mode,
+        )
+
+    if cmd == "rotate":
+        if ns.ready_timeout <= 0 or ns.verify_timeout <= 0:
+            raise CliError(
+                "INVALID_TIMEOUT",
+                "--ready-timeout and --verify-timeout must be positive.",
+                "Pass positive durations such as `--ready-timeout 45 --verify-timeout 10`.",
+                exit_code=EXIT_USAGE,
+            )
+        raw_snap = client.snapshot()
+        caller = resolve_caller_context(raw_snap, env)
+        tabs = parse_workspace_tabs(
+            raw_snap,
+            caller.workspace_id,
+            self_tab_id=caller.tab_id,
+            self_pane_id=caller.pane_id,
+        )
+        state_dir = resolve_state_dir(env)
+        handoff_json_path, handoff_md_path = resolve_handoff_paths(state_dir, caller.workspace_id)
+        prev_handoff = load_handoff_state(handoff_json_path)
+
+        def _save_handoff(payload: Mapping[str, object], markdown: str) -> None:
+            save_handoff_state(handoff_json_path, handoff_md_path, payload, markdown)
+
+        if ns.ack is not None:
+            result = execute_rotate_ack(
+                caller=caller,
+                tabs=tabs,
+                ack_pane_id=ns.ack,
+                prev_handoff=prev_handoff,
+                handoff_json_path=str(handoff_json_path),
+                handoff_md_path=str(handoff_md_path),
+                save_handoff=_save_handoff,
+                close_pane=pane_close,
+                force=bool(ns.force),
+                dry_run=bool(ns.dry_run),
+            )
+            return format_rotate(result, mode)
+
+        plan = plan_rotate(
+            caller=caller,
+            tabs=tabs,
+            launcher_name=ns.launcher,
+            direction=ns.direction,
+            rotate_ctx=ns.rotate_ctx,
+            cooldown=float(ns.cooldown),
+            prev_handoff=prev_handoff,
+            cursor_name=ns.cursor,
+            auto_config=ns.auto_config,
+            pending_decisions=ns.decision,
+            note=ns.note,
+            force=bool(ns.force),
+        )
+        recent_audit = read_recent_audit_lines(state_dir, limit=10)
+        result = execute_rotate(
+            plan,
+            client=client,
+            split_pane=pane_split,
+            run_pane=pane_run,
+            start_agent=agent_start,
+            prompt_fn=agent_prompt,
+            env=env,
+            handoff_json_path=str(handoff_json_path),
+            handoff_md_path=str(handoff_md_path),
+            save_handoff=_save_handoff,
+            recent_audit=recent_audit,
+            select_backend=ai_agent_select_backend,
+            trust_workspace=_make_trust_callback(bool(ns.auto_trust), mode),
+            read_pane=client.read_pane,
+            send_keys=agent_send_keys,
+            dry_run=bool(ns.dry_run),
+            ready_timeout=float(ns.ready_timeout),
+            verify_timeout=float(ns.verify_timeout),
+        )
+        return format_rotate(result, mode)
 
     if cmd == "tab":
         return _dispatch_tab(ns, client, env, mode)
@@ -1303,6 +1785,8 @@ def _dispatch_tab(
             env=env,
             select_backend=ai_agent_select_backend,
             trust_workspace=_make_trust_callback(bool(ns.auto_trust), mode),
+            read_pane=getattr(client, "read_pane", None),
+            send_keys=agent_send_keys,
             dry_run=bool(ns.dry_run),
             ready_timeout=float(ns.ready_timeout),
         )
@@ -1479,6 +1963,8 @@ def _dispatch_pane(
             env=env,
             select_backend=ai_agent_select_backend,
             trust_workspace=_make_trust_callback(bool(ns.auto_trust), mode),
+            read_pane=getattr(client, "read_pane", None),
+            send_keys=agent_send_keys,
             dry_run=bool(ns.dry_run),
             ready_timeout=float(ns.ready_timeout),
         )
