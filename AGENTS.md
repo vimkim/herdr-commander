@@ -10,7 +10,7 @@ Repository guidance for `herdr-commander` (`hcmd`, legacy alias `hss`).
 - `src/herdr_commander/orchestrate.py`: Pure planning and execution for `ensure`, `send`, `wait`, `tab`, and `pane`.
 - `src/herdr_commander/formatters.py`: Output mode detection and `human`, `plain`, and `json` renderers.
 - `src/herdr_commander/cli.py`: CLI entry point; only module permitted to write to stdout/stderr or exit.
-- `skill/herdr-commander/SKILL.md`: Commander orchestration skill linked by `just install-skill`.
+- `skills/herdr-commander/SKILL.md`: Commander orchestration skill installed by `just install-skills`.
 
 ## Rules
 

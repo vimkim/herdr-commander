@@ -42,7 +42,7 @@ Run from a clean `main` checkout:
 just sync
 ```
 
-This installs `herdr-commander`, `hcmd`, and compatibility alias `hss` via `uv tool install --reinstall .` and symlinks every skill directory under `skill/*` (`herdr-commander`, `herdr-commander-init`, `hcmd-init`, `hcmd-check`, `hcmd-auto`) into:
+This installs `herdr-commander`, `hcmd`, and compatibility alias `hss` via `uv tool install --reinstall .` and copies every skill directory under `skills/*` (`herdr-commander`, `herdr-commander-init`, `hcmd-init`, `hcmd-check`, `hcmd-auto`) into `~/.agents/skills/<skill>`, symlinking it for:
 
 - `~/.agents/skills/<skill>`
 - `~/.claude/skills/<skill>` (Claude)
@@ -270,10 +270,10 @@ Business logic stays pure and testable in the Python ≥3.11 standard library, w
 | [`src/herdr_commander/orchestrate.py`](src/herdr_commander/orchestrate.py) | Pure planning and execution for `ensure`, `send`, `wait`, `tab`, and `pane` |
 | [`src/herdr_commander/formatters.py`](src/herdr_commander/formatters.py) | Output mode detection and `human`, `plain`, and `json` renderers |
 | [`src/herdr_commander/cli.py`](src/herdr_commander/cli.py) | CLI entry point; sole module writing to stdout/stderr or exiting |
-| [`skill/herdr-commander/SKILL.md`](skill/herdr-commander/SKILL.md) | Compatibility wrapper delegating across Commander skills |
-| [`skill/herdr-commander-init/SKILL.md`](skill/herdr-commander-init/SKILL.md) | Canonical bootstrap, dispatch, and `--handoff` resume skill (`hcmd-init` alias) |
-| [`skill/hcmd-check/SKILL.md`](skill/hcmd-check/SKILL.md) | Lean delta harvest and decision-first Korean brief skill |
-| [`skill/hcmd-auto/SKILL.md`](skill/hcmd-auto/SKILL.md) | Event-driven autonomous watch loop, fail-closed & conditional standing safety allowlist, and self-rotation skill |
+| [`skills/herdr-commander/SKILL.md`](skills/herdr-commander/SKILL.md) | Compatibility wrapper delegating across Commander skills |
+| [`skills/herdr-commander-init/SKILL.md`](skills/herdr-commander-init/SKILL.md) | Canonical bootstrap, dispatch, and `--handoff` resume skill (`hcmd-init` alias) |
+| [`skills/hcmd-check/SKILL.md`](skills/hcmd-check/SKILL.md) | Lean delta harvest and decision-first Korean brief skill |
+| [`skills/hcmd-auto/SKILL.md`](skills/hcmd-auto/SKILL.md) | Event-driven autonomous watch loop, fail-closed & conditional standing safety allowlist, and self-rotation skill |
 | [`hcmd.just`](hcmd.just) | Parameterless `hcmd` CLI lifecycle and query presets (`just --list hcmd` / `just hcmd <recipe>`) |
 
 ## Development

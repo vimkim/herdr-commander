@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SKILL_ROOT = REPO_ROOT / "skill"
+SKILL_ROOT = REPO_ROOT / "skills"
 JUSTFILE_PATH = REPO_ROOT / "justfile"
 
 EXPECTED_SKILLS = (
