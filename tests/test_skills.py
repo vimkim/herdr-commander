@@ -52,6 +52,30 @@ class SkillPackagingTests(unittest.TestCase):
         self.assertIn('for src in "$skill_root"/*', just_text)
         self.assertIn('[ -d "$src" ] && [ -f "$src/SKILL.md" ]', just_text)
 
+    def test_hcmd_auto_documents_standing_allowlist_guardrails(self) -> None:
+        text = (SKILL_ROOT / "hcmd-auto" / "SKILL.md").read_text(encoding="utf-8")
+        required_markers = (
+            "#### Conditional Standing Allowlist (CUBRID PR Sync & CI)",
+            "vk/*",
+            "tc/pr-<N>",
+            "/run all",
+            "/run rerun <run-id>",
+            "cubrid-ci-watch register",
+            "git merge origin/develop",
+            "--force-with-lease",
+            "conflict",
+            "just build",
+            "cubrid-pr-tc-base-check --pr <N>",
+            "cubrid-tcr blockers",
+            "READY",
+            "max 2",
+            "auto-audit.jsonl",
+            "hcmd rotate --auto-config",
+            "[AUTO-POLICY: standing-approved]",
+        )
+        for marker in required_markers:
+            self.assertIn(marker, text)
+
 
 if __name__ == "__main__":
     unittest.main()

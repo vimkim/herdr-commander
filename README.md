@@ -146,11 +146,11 @@ Inspect the calling pane's context-window usage from its rendered `ay` / `claude
 
 ```bash
 hcmd self-context --rotate-ctx 30 --json
-hcmd rotate --rotate-ctx 30 --cursor auto-watch --json
+hcmd rotate --rotate-ctx 30 --cursor auto-watch --auto-config "cubrid-pr-sync-standing-allowlist" --json
 hcmd rotate --ack <old_pane_id> --json
 ```
 
-- `hcmd rotate` splits the caller's tab (`t1`, preserving `tabs[0]` and all sub-tabs), enforces a 300s cooldown (`--cooldown`, `--force`), saves handoff state under `${XDG_STATE_HOME:-~/.local/state}/herdr-commander/handoff/`, launches the successor agent (`ay` default, dismissing any startup overlay and verifying `working`), and leaves the old pane alive until the successor completes init and runs `hcmd rotate --ack <old_pane_id>`.
+- `hcmd rotate` splits the caller's tab (`t1`, preserving `tabs[0]` and all sub-tabs), enforces a 300s cooldown (`--cooldown`, `--force`), saves handoff state under `${XDG_STATE_HOME:-~/.local/state}/herdr-commander/handoff/` (propagating `/hcmd-auto` standing policy summaries via `--auto-config`), launches the successor agent (`ay` default, dismissing any startup overlay and verifying `working`), and leaves the old pane alive until the successor completes init and runs `hcmd rotate --ack <old_pane_id>`.
 
 ### `ensure`
 
@@ -273,7 +273,7 @@ Business logic stays pure and testable in the Python ≥3.11 standard library, w
 | [`skill/herdr-commander/SKILL.md`](skill/herdr-commander/SKILL.md) | Compatibility wrapper delegating across Commander skills |
 | [`skill/herdr-commander-init/SKILL.md`](skill/herdr-commander-init/SKILL.md) | Canonical bootstrap, dispatch, and `--handoff` resume skill (`hcmd-init` alias) |
 | [`skill/hcmd-check/SKILL.md`](skill/hcmd-check/SKILL.md) | Lean delta harvest and decision-first Korean brief skill |
-| [`skill/hcmd-auto/SKILL.md`](skill/hcmd-auto/SKILL.md) | Event-driven autonomous watch loop, safety allowlist, and self-rotation skill |
+| [`skill/hcmd-auto/SKILL.md`](skill/hcmd-auto/SKILL.md) | Event-driven autonomous watch loop, fail-closed & conditional standing safety allowlist, and self-rotation skill |
 | [`hcmd.just`](hcmd.just) | Parameterless `hcmd` CLI lifecycle and query presets (`just --list hcmd` / `just hcmd <recipe>`) |
 
 ## Development

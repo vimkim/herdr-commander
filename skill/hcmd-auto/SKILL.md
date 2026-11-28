@@ -39,11 +39,35 @@ Autonomous action is permitted **only** when the action unambiguously falls insi
 - **Local build, test, & reproduction**: Dispatching follow-up local build/test/repro/audit prompts to an idle/done Space when within the current task's approved scope and circuit-breaker budget.
 - **Verification audits**: Triggering `close-gate` or local test re-checks before marking work ready.
 - **Verified tracker updates**: Recording concrete commit SHAs, test counts, or verified blockers via `work-tracker` (`track-work`) or `failure-tracker`.
-- **Pre-agreed standing policies**: Actions explicitly pre-authorized by the user in this session or handoff (for example, flaky CI `/run rerun` up to 3 attempts when failure matches a known transient signature).
+- **Pre-agreed standing policies**: Actions explicitly pre-authorized by the user in this session or handoff (for example, flaky CI `/run rerun` up to 3 attempts when failure matches a known transient signature), and actions satisfying every guardrail in `Conditional Standing Allowlist (CUBRID PR Sync & CI)` below.
+
+#### Conditional Standing Allowlist (CUBRID PR Sync & CI)
+
+Pre-approved autonomous CUBRID PR sync and CI recovery is permitted **only** when **all 5 guardrails** below hold:
+
+1. **Branch/remote scope**:
+   - Allow `git push` **ONLY** to the user's open PR head branch (`vk/*`) and linked TC branches (`tc/pr-<N>`), plus posting `/run all` or `/run rerun <run-id>` and running `cubrid-ci-watch register` on that PR.
+   - Keep `origin` (`CUBRID/cubrid`) `develop`/`release/*`/`feature/*` direct push, `gh pr merge`, draft/reviewer/description edits, JIRA mutations, and workspace/worktree deletion on the Hard Blocklist.
+2. **`merge` vs `rebase --force-with-lease`**:
+   - On PRs that already have human reviews or approvals: allow `git merge origin/develop` + normal push **only** (escalate any `rebase --force-with-lease`).
+   - On unapproved/Draft PRs: allow either `git rebase origin/develop` + `git push --force-with-lease` (`git rebase origin/develop --force-with-lease`) or `git merge origin/develop` + normal push.
+3. **Mandatory local pre-push/CI gates** (all must pass before pushing or posting `/run`):
+   - `conflict == 0` (abort and escalate immediately on any merge/rebase conflict).
+   - Local `just build` passes.
+   - `cubrid-pr-tc-base-check --pr <N>` exits `0`.
+   - No in-flight `/run` on the PR.
+   - Prefer `/run rerun <run-id>` over `/run all` when an eligible same-head run exists.
+4. **Verified unblock trigger & runaway cap**:
+   - Trigger autonomous unblock recovery **only** when `cubrid-tcr blockers` reports `READY` or the blocking fix PR is verified merged into `origin/develop` via `gh`/`git`.
+   - Cap autonomous `sync + /run all` at **max 2 per PR per session**, integrated with the per-Space circuit breaker (Section 3).
+   - Log every action (triggers, gate results, dispatches, skips, and cap trips) in `auto-audit.jsonl` (Section 4).
+5. **Runtime handoff & Space Lead prompt tag**:
+   - Propagate the standing allowlist summary across pane rotations via `hcmd rotate --auto-config "<summary>"` (Section 5).
+   - When dispatching an allowed sync/CI action to a Space Lead via `hcmd send`, include `[AUTO-POLICY: standing-approved]` plus the mandatory gate checklist (`conflict==0`, `just build`, `cubrid-pr-tc-base-check --pr <N>`, no in-flight `/run`, prefer `/run rerun <run-id>`, merge-only if human-reviewed/approved, push scope `vk/*` + `tc/pr-<N>`) so Space Lead executes without re-asking.
 
 ### Hard Blocklist (NEVER Autonomous — Always Escalate)
-- **NO** `git push` or `git push --force` to `CUBRID/*` or any shared/upstream remote.
-- **NO** `gh pr merge`, PR comments, PR reviews, or PR description edits on external repositories.
+- **NO** direct `git push` or `git push --force` to `origin` (`CUBRID/cubrid`) `develop`, `release/*`, `feature/*`, or any branch/remote outside the user's open PR head branch (`vk/*`) and linked TC branches (`tc/pr-<N>`) under the Conditional Standing Allowlist (and **NEVER** `rebase --force-with-lease` on PRs with human reviews or approvals).
+- **NO** `gh pr merge`, PR reviews, draft/reviewer/description edits, or general PR comments on external repositories (only `/run all` or `/run rerun <run-id>` plus `cubrid-ci-watch register` on the user's open PR when all Conditional Standing Allowlist gates pass).
 - **NO** live JIRA mutations (`cubrid-jira` transitions, comments, or description updates).
 - **NO** `herdr workspace close` or `cubrid-worktree delete` / `git worktree remove`.
 - **NO** answering `AGENT_BLOCKED` prompts that involve design choices, destructive commands, external side effects, or ambiguous user intent.
@@ -51,10 +75,10 @@ Autonomous action is permitted **only** when the action unambiguously falls insi
 
 ## 3. Per-Space Circuit Breaker
 
-- Maintain a per-Space consecutive autonomous dispatch counter (`<= 3` max, configurable down to `2` if requested) without human check-in.
+- Maintain a per-Space consecutive autonomous dispatch counter (`<= 3` max, configurable down to `2` if requested) without human check-in, and enforce the Conditional Standing Allowlist cap of **max 2** autonomous `sync + /run all` cycles per PR per session.
 - Reset a Space's counter when the user explicitly interacts with or confirms that Space.
-- When a Space hits the cap (e.g., 3 consecutive autonomous follow-ups without finishing cleanly or needing user input):
-  - **Pause** autonomous dispatches to that Space.
+- When a Space or PR hits its cap (e.g., 3 consecutive autonomous follow-ups without finishing cleanly or needing user input, or max 2 `sync + /run all` recoveries on one PR in a session):
+  - **Pause** autonomous dispatches to that Space/PR.
   - Record a `"circuit_breaker_tripped"` entry in `auto-audit.jsonl`.
   - Escalate to the user with a 1-line summary and recommendation.
 
@@ -68,7 +92,7 @@ Required fields per JSONL line:
 {"ts":"2026-11-28T16:30:00+09:00","workspace_id":"w3","tracker_id":1124,"action":"dispatch_followup","reason":"test_repro","outcome":"sent","consecutive":1}
 ```
 
-Never log secrets, tokens, or full terminal dumps in `auto-audit.jsonl`.
+For Conditional Standing Allowlist actions, also include PR, policy, and cap fields when applicable (e.g., `"pr":1234,"pr_sync_count":1,"policy":"standing-approved"`). Never log secrets, tokens, or full terminal dumps in `auto-audit.jsonl`.
 
 ## 5. Self-Context Check & Safe Same-Tab Rotation
 
@@ -82,7 +106,7 @@ hcmd self-context --rotate-ctx 30 --json
 
 When `data.should_rotate == true`:
 1. Summarize any pending human decisions (`--decision "..."`) and active watch cursor (`--cursor <name>`).
-2. Initiate 2-phase same-tab rotation (splits `t1` right without creating a new tab, writes handoff state, launches successor `ay`, and verifies startup prompt acceptance):
+2. Initiate 2-phase same-tab rotation (splits `t1` right without creating a new tab, writes handoff state, launches successor `ay`, and verifies startup prompt acceptance); pass `--auto-config "<summary>"` carrying the active Conditional Standing Allowlist summary (and any non-zero per-PR sync counts) so the successor pane preserves the policy across rotation:
    ```bash
    hcmd rotate --rotate-ctx 30 [--cursor <name>] [--auto-config "<summary>"] [--decision "..."] --json
    ```
